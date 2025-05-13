@@ -18,6 +18,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 from torch.distributed._tensor import DTensor
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import is_pp_missing_parameter
 
@@ -223,9 +224,6 @@ def qwen2vl_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) ->
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype))
 
 
-from vllm.model_executor.layers.fused_moe import FusedMoE
-
-
 def deepseekv2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn.Module:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
@@ -387,8 +385,7 @@ def load_dtensor_weights(actor_weights: Dict, vllm_model: nn.Module):
 def _get_model_weight_loader(arch: str):
     if arch in __MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__:
         return __MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__[arch]
-    raise ValueError(f"Model architectures {arch} are not supported for now. "
-                     f"Supported architectures: {__MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__.keys()}")
+    raise ValueError(f"Model architectures {arch} are not supported for now. Supported architectures: {__MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__.keys()}")
 
 
 # NOTE(sgm): we use per-parameter weight loader in each vllm sub
