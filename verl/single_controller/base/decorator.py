@@ -46,6 +46,8 @@ def init_predefined_dispatch_mode():
     Dispatch.register("DIRECT_ROLLOUT_METHOD")
     
     Dispatch.register("TP_ONE_TO_ALL_DESIGNATED")
+    Dispatch.register("ALL_TO_ONE")
+    Dispatch.register("DP_COMPUTE_PROTO_DESIGNATED")
 
 
 class Execute(DynamicEnum):
@@ -362,6 +364,28 @@ def dispatch_dp_compute_data_proto(worker_group, *args, **kwargs):
     )
     return splitted_args, splitted_kwargs
 
+def dispatch_dp_compute_data_proto_designared(worker_group, *args, **kwargs):
+    from verl.single_controller.base.worker_group import WorkerGroup
+
+    assert isinstance(worker_group, WorkerGroup)
+    ranks = []
+    if 'ranks' in kwargs:
+        ranks.extend(kwargs['ranks'])
+        del kwargs['ranks']
+    if len(ranks) == 0:
+        raise RuntimeError(
+            "When using \'EXECUTE_RANK_DESIGNATED\' as excution method "
+            "\'ranks\' must be a valid parameter."
+        )
+    # Note: enable auto padding for dp compute DatapProto
+    splitted_args, splitted_kwargs = _split_args_kwargs_data_proto_with_auto_padding(
+        len(ranks),
+        *args,
+        **kwargs,
+    )
+    
+    splitted_kwargs['ranks'] = ranks
+    return splitted_args, splitted_kwargs
 
 def dispatch_dp_compute_data_proto_with_func(worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
@@ -386,27 +410,53 @@ def collect_dp_compute_data_proto(worker_group, output):
     return _concat_data_proto_or_future(output)
 
 
-<<<<<<< HEAD
 def dispatch_one_to_all_designated(worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
     assert isinstance(worker_group, WorkerGroup)
     ranks = []
     if 'ranks' in kwargs:
         ranks.extend(kwargs['ranks'])
+        del kwargs['ranks']
     if len(ranks) == 0:
         raise RuntimeError(
-            "When using \'execute_rank_part\' as excution method "
+            "When using \'EXECUTE_RANK_DESIGNATED\' as excution method "
             "\'ranks\' must be a valid parameter."
         )
+    args = tuple([arg] * len(ranks) for arg in args)
+    kwargs = {k: [v] * len(ranks) for k, v in kwargs.items()}
+
+    kwargs['ranks'] = ranks
+    return args, kwargs
+
+def dispatch_one_to_only_designated(worker_group, *args, **kwargs):
+    from verl.single_controller.base.worker_group import WorkerGroup
+    assert isinstance(worker_group, WorkerGroup)
+    ranks = []
+    if 'ranks' in kwargs:
+        ranks.extend(kwargs['ranks'])
+        del kwargs['ranks']
+    if len(ranks) == 0:
+        raise RuntimeError(
+            "When using \'EXECUTE_RANK_DESIGNATED\' as excution method "
+            "\'ranks\' must be a valid parameter."
+        )
+    args = tuple([arg] * len(ranks) for arg in args)
+    kwargs = {k: [v] * len(ranks) for k, v in kwargs.items()}
+
+    kwargs['ranks'] = ranks
     return args, kwargs
 
 
 def collect_dp_compute_designated(worker_group, output):
+    import ray
+    from verl.protocol import DataProto
     from verl.single_controller.base.worker_group import WorkerGroup
+
     assert isinstance(worker_group, WorkerGroup)
-    # TODO: define a new parameter to get the length
-    # assert len(output) == worker_group.world_size
-    return output
+    for o in output:
+        assert isinstance(o, (DataProto, ray.ObjectRef)), f"expecting {o} to be DataProto, but got {type(o)}"
+    
+    return _concat_data_proto_or_future(output)
 
 
 def collect_tp_compute_data_proto_designated(worker_group, output):
@@ -414,65 +464,14 @@ def collect_tp_compute_data_proto_designated(worker_group, output):
     import ray
 
     for o in output:
-        assert isinstance(o, (DataProto, ray.ObjectRef)), f"expecting {o} to be DataProto, but got {type(o)}"
+        assert isinstance(o, (DataProto, ray.ObjectRef)) or (not o), f"expecting {o} to be DataProto, but got {type(o)}"
 
-    output = collect_dp_compute_designated(worker_group, output)
+    return output[0]
+
+def collect_only_one(worker_group, output):
     return output[0]
 
 
-def get_predefined_dispatch_fn(dispatch_mode):
-    predefined_dispatch_mode_fn = {
-        Dispatch.ONE_TO_ALL: {
-            'dispatch_fn': dispatch_one_to_all,
-            'collect_fn': collect_all_to_all,
-        },
-        Dispatch.ALL_TO_ALL: {
-            'dispatch_fn': dispatch_all_to_all,
-            'collect_fn': collect_all_to_all,
-        },
-        Dispatch.MEGATRON_COMPUTE: {
-            'dispatch_fn': dispatch_megatron_compute,
-            'collect_fn': collect_megatron_compute,
-        },
-        Dispatch.MEGATRON_PP_AS_DP: {
-            'dispatch_fn': dispatch_megatron_pp_as_dp,
-            'collect_fn': collect_megatron_pp_as_dp,
-        },
-        Dispatch.MEGATRON_PP_ONLY: {
-            'dispatch_fn': dispatch_one_to_all,
-            'collect_fn': collect_megatron_pp_only
-        },
-        Dispatch.MEGATRON_COMPUTE_PROTO: {
-            'dispatch_fn': dispatch_megatron_compute_data_proto,
-            'collect_fn': collect_megatron_compute_data_proto
-        },
-        Dispatch.MEGATRON_PP_AS_DP_PROTO: {
-            'dispatch_fn': dispatch_megatron_pp_as_dp_data_proto,
-            'collect_fn': collect_megatron_pp_as_dp_data_proto
-        },
-        Dispatch.DP_COMPUTE: {
-            'dispatch_fn': dispatch_dp_compute,
-            'collect_fn': collect_dp_compute
-        },
-        Dispatch.DP_COMPUTE_PROTO: {
-            'dispatch_fn': dispatch_dp_compute_data_proto,
-            'collect_fn': collect_dp_compute_data_proto
-        },
-        Dispatch.DP_COMPUTE_PROTO_WITH_FUNC: {
-            'dispatch_fn': dispatch_dp_compute_data_proto_with_func,
-            'collect_fn': collect_dp_compute_data_proto
-        },
-        Dispatch.DP_COMPUTE_METRIC: {
-            'dispatch_fn': dispatch_dp_compute_data_proto,
-            'collect_fn': collect_dp_compute
-        },
-        Dispatch.TP_ONE_TO_ALL_DESIGNATED: {
-            'dispatch_fn': dispatch_one_to_all_designated,
-            'collect_fn': collect_tp_compute_data_proto_designated
-        }
-    }
-    return predefined_dispatch_mode_fn[dispatch_mode]
-=======
 # Global registry for dispatch mode.
 DISPATCH_MODE_FN_REGISTRY = {
     Dispatch.ONE_TO_ALL: {
@@ -514,6 +513,18 @@ DISPATCH_MODE_FN_REGISTRY = {
         "dispatch_fn": dummy_direct_rollout_call,
         "collect_fn": dummy_direct_rollout_call,
     },
+    Dispatch.TP_ONE_TO_ALL_DESIGNATED: {
+        'dispatch_fn': dispatch_one_to_all_designated,
+        'collect_fn': collect_tp_compute_data_proto_designated,
+    },
+    Dispatch.ALL_TO_ONE: {
+        'dispatch_fn': dispatch_one_to_all,
+        'collect_fn': collect_only_one,
+    },
+    Dispatch.DP_COMPUTE_PROTO_DESIGNATED: {
+        'dispatch_fn': dispatch_dp_compute_data_proto_designared,
+        'collect_fn': collect_dp_compute_designated,
+    },
 }
 
 
@@ -538,7 +549,6 @@ def update_dispatch_mode(dispatch_mode, dispatch_fn, collect_fn):
     _check_dispatch_mode(dispatch_mode)
     assert dispatch_mode in DISPATCH_MODE_FN_REGISTRY, f"dispatch_mode {dispatch_mode} not found"
     DISPATCH_MODE_FN_REGISTRY[dispatch_mode] = {"dispatch_fn": dispatch_fn, "collect_fn": collect_fn}
->>>>>>> d4a11ebb44eece7baa28acd7ce66fe0489169445
 
 
 def get_predefined_execute_fn(execute_mode):

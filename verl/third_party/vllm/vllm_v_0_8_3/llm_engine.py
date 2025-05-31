@@ -18,41 +18,30 @@ from functools import partial
 from typing import Callable, Dict, Iterable, Optional, Type, Union, List
 
 import torch.nn as nn
+import vllm.envs as envs
 from vllm.config import (
-    CacheConfig,
     DecodingConfig,
-    DeviceConfig,
-    EngineConfig,
-    LoRAConfig,
     ObservabilityConfig,
-    ParallelConfig,
-    PromptAdapterConfig,
-    SchedulerConfig,
-    SpeculativeConfig,
+    VllmConfig,
 )
 from vllm.engine.arg_utils import EngineArgs
 from vllm.core.scheduler import Scheduler
-from vllm.engine.llm_engine import LLMEngine, SchedulerContext, SchedulerOutputState, _load_generation_config_dict
+from vllm.engine.llm_engine import LLMEngine, SchedulerContext, SchedulerOutputState
 from vllm.engine.metrics_types import StatLoggerBase
 from vllm.engine.output_processor.interfaces import SequenceGroupOutputProcessor
 from vllm.engine.output_processor.stop_checker import StopChecker
 from vllm.executor.executor_base import ExecutorBase
 from vllm.inputs import INPUT_REGISTRY, InputRegistry
 from vllm.inputs.preprocess import InputPreprocessor
-from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.engine.output_processor.util import create_output_by_sequence_group
-from vllm.outputs import (EmbeddingRequestOutput, RequestOutput,
-                          RequestOutputFactory)
+from vllm.outputs import (EmbeddingRequestOutput, RequestOutput)
 from vllm.logger import init_logger
-from vllm.sequence import (EmbeddingSequenceGroupOutput, ExecuteModelRequest,
-                           Sequence, SequenceGroup, SequenceGroupMetadata,
-                           SequenceStatus)
+from vllm.sequence import (ExecuteModelRequest, Sequence, SequenceGroup)
+from vllm.utils import (Counter, resolve_obj_by_qualname, weak_bind)
 from vllm.tracing import init_tracer
 from vllm.transformers_utils.detokenizer import Detokenizer
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
-from vllm.utils import Counter, weak_bind
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -245,11 +234,11 @@ class LLMEngine(LLMEngine):
         # Create the scheduler.
         # NOTE: the cache_config here have been updated with the numbers of
         # GPU and CPU blocks, which are profiled in the distributed executor.
-        if isinstance(self.vllm_config.scheduler_config.scheduler_cls, str):
-            Scheduler = resolve_obj_by_qualname(
-                self.vllm_config.scheduler_config.scheduler_cls)
-        else:
-            Scheduler = self.vllm_config.scheduler_config.scheduler_cls
+        # if isinstance(self.vllm_config.scheduler_config.scheduler_cls, str):
+        #     Scheduler = resolve_obj_by_qualname(
+        #         self.vllm_config.scheduler_config.scheduler_cls)
+        # else:
+        #     Scheduler = self.vllm_config.scheduler_config.scheduler_cls
         self.scheduler = [
             Scheduler(
                 self.scheduler_config, self.cache_config, self.lora_config,
@@ -320,7 +309,36 @@ class LLMEngine(LLMEngine):
         # Overlapping
         self.fuse_enable = False
         self.max_response_len = 0
+        self.init_request_num = 0
+        self.fuse_threshold = 0.15 # default
         
+    @classmethod
+    def from_engine_args(
+        cls,
+        engine_args: EngineArgs,
+        usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
+        stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
+        partial_rollout_save_steps: Optional[int] = None,
+    ) -> "LLMEngine":
+        """Creates an LLM engine from the engine arguments."""
+        # Create the engine configs.
+        vllm_config = engine_args.create_engine_config(usage_context)
+
+        engine_cls = cls
+        if envs.VLLM_USE_V1:
+            from vllm.v1.engine.llm_engine import LLMEngine as V1LLMEngine
+            raise ValueError('Now we do not support V1 Engine.')
+            engine_cls = V1LLMEngine
+
+        print("create vllm llm engine")
+        return engine_cls.from_vllm_config(
+            vllm_config=vllm_config,
+            usage_context=usage_context,
+            stat_loggers=stat_loggers,
+            disable_log_stats=engine_args.disable_log_stats,
+            # partial_rollout_save_steps=partial_rollout_save_steps,
+        )
+
     def set_partial_rollout_enable(self, partial_rollout_enable: bool, virtual_engine=0) -> None:
         self.partial_rollout_enable = partial_rollout_enable
         self.scheduler[virtual_engine].set_partial_rollout_enable(partial_rollout_enable)
@@ -534,13 +552,13 @@ class LLMEngine(LLMEngine):
                     self.scheduler[virtual_engine].transfer_partial_rollout_requests(request_id)
         
         if self.fuse_enable:
-            fuse_threshold = self.partial_rollout_save_steps - 100 if self.partial_rollout_save_steps else 0.6 * self.max_response_len
-            for seq_group_metadata in seq_group_metadata_list:
-                request_id = seq_group_metadata.request_id
-                if self.scheduler[virtual_engine].get_rollout_steps(request_id) > fuse_threshold:
+            if self.get_request_num() < self.fuse_threshold * self.init_request_num:
+                for seq_group in self.scheduler[virtual_engine].get_request_list():
+                    request_id = seq_group.request_id
                     self.scheduler[virtual_engine].add_fused_request_id(request_id)
                     self.scheduler[virtual_engine].transfer_fused_requests(request_id)
-        
+                
+
         if not self.has_unfinished_requests():
             # Drain async postprocessor (if exists)
             if len(ctx.output_queue) > 0:
@@ -591,3 +609,10 @@ class LLMEngine(LLMEngine):
 
     def set_max_response_len(self, max_response_len: int) -> None:
         self.max_response_len = max_response_len
+        
+    def get_request_num(self, virtual_engine=0) -> int:
+        return self.scheduler[virtual_engine].get_request_num()
+
+    def set_init_request_num(self, init_request_num: int) -> None:
+        self.init_request_num = init_request_num
+

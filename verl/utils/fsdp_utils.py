@@ -389,7 +389,7 @@ def get_fsdp_state_ctx(model, state_type, state_cfg, optim_cfg):
         return nullcontext()
 
 
-def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_mesh=None, cpu_offload=None):
+def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_mesh=None, cpu_offload=None, group=None):
     """
     Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
     parameters from rank 0 to all other ranks. This function modifies the model in-place.
@@ -401,7 +401,8 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
     # To broadcast, it needs to be instantiated in the GPU.
-    if dist.get_rank() == 0:
+    rank = dist.get_rank(group=group)
+    if rank == 0:
         model = model.to(device=torch.cuda.current_device(), non_blocking=True)
     else:
         model = model.to_empty(device=torch.cuda.current_device())
@@ -411,8 +412,10 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_
     set_model_state_dict(model, full_state, options=options)
 
     # rotary_emb is not in state_dict, so we need to broadcast it manually
+    print(f"dist.broadcast begin, rank={rank}")
     for name, buf in model.named_buffers():
-        dist.broadcast(buf, src=0)
+        dist.broadcast(buf, src=0, group=group)
+    print(f"dist.broadcast end, rank={rank}")
 
     if cpu_offload:
         model.to("cpu", non_blocking=True)

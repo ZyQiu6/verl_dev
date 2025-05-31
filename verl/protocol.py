@@ -37,7 +37,7 @@ from torch.utils.data import DataLoader
 from verl.utils.py_functional import union_two_dict
 from verl.utils.torch_functional import allgather_dict_tensors
 
-__all__ = ["DataProto", "union_tensor_dict"]
+__all__ = ["DataProto", "union_tensor_dict", 'DataProtoFuture']
 
 with contextlib.suppress(Exception):
     tensordict.set_lazy_legacy(False).set()

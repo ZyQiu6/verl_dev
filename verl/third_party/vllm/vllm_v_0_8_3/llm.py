@@ -13,27 +13,22 @@
 # limitations under the License.
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/llm.py
 
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Optional, Union, cast, overload, Dict, Iterable, List, Tuple
+
 
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
-from transformers import PretrainedConfig, PreTrainedTokenizer, PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizer
 from vllm import LLM
 from vllm.outputs import EmbeddingRequestOutput, RequestOutput
-from vllm.utils import Counter
-from vllm.inputs import PromptType, TextPrompt, TokensPrompt
-from vllm.lora.request import LoRARequest
-from vllm.prompt_adapter.request import PromptAdapterRequest
-from vllm.sampling_params import SamplingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.sequence import SequenceGroup
-from vllm.model_executor.guided_decoding.guided_fields import (
-    GuidedDecodingRequest, LLMGuidedOptions)
 from vllm.engine.arg_utils import (EngineArgs, HfOverrides, PoolerConfig,
                                    TaskOption)
+from vllm.utils import (Counter, deprecate_args, deprecate_kwargs)
 
-from .llm_engine_sp import LLMEngine
+from .llm_engine import LLMEngine
 
 from tqdm import tqdm
 
@@ -180,13 +175,14 @@ class LLM(LLM):
             mm_processor_kwargs=mm_processor_kwargs,
             override_pooler_config=override_pooler_config,
             compilation_config=compilation_config_instance,
-            partial_rollout_save_steps=partial_rollout_save_steps,
             **kwargs,
         )
 
         # Create the Engine (autoselects V0 vs V1)
         self.llm_engine = LLMEngine.from_engine_args(
-            engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
+            engine_args=engine_args, 
+            usage_context=UsageContext.LLM_CLASS,
+            partial_rollout_save_steps=partial_rollout_save_steps,)
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()
@@ -195,10 +191,10 @@ class LLM(LLM):
         # Partial rollout
         self.partial_rollout_save_steps = partial_rollout_save_steps
         if partial_rollout_save_steps:
-            if not partial_rollout_mode in ["reuse", "recompute"]:
+            if not partial_rollout_mode in ["recompute"]:
                 raise ValueError(
                     f"Unexpected partial_rollout_mode value: {partial_rollout_mode}. Must be"
-                    "one of the following: reuse, recompute"
+                    "one of the following: [recompute]"
                 )
         self.partial_rollout_mode = partial_rollout_mode
         self.llm_engine.set_partial_rollout_mode(partial_rollout_mode)
@@ -209,6 +205,9 @@ class LLM(LLM):
         self.fuse_enable = False
 
     def _run_engine(self, *, use_tqdm: bool) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
+        # Begin to run_engine, update request num
+        self.llm_engine.set_init_request_num(self.llm_engine.get_request_num())
+        
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
@@ -331,7 +330,8 @@ class LLM(LLM):
                 output_fused.append(self.llm_engine.is_request_fused(request_output.request_id))
                 seq_finished.append(output.finished())
 
-        pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None else self.llm_engine.tokenizer.eos_token_id
+        pad_token_id = self.llm_engine.tokenizer.tokenizer.pad_token_id if self.llm_engine.tokenizer.tokenizer.pad_token_id is not None \
+                        else self.llm_engine.tokenizer.tokenizer.eos_token_id
         output_token_ids = pad_sequence(output_token_ids, batch_first=True, padding_value=pad_token_id)
         if len(logprobs) > 0:
             logprobs = pad_sequence(logprobs, batch_first=True, padding_value=pad_token_id)
