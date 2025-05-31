@@ -159,47 +159,43 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.gen_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.torch_random_states)
 
-    def reload(self):
-        log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
-        # Copy, not share memory
-        load_format = 'hf' if self.full_params else 'dtensor'
-        if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
-            self.inference_engine.load_model_weights(load_format=load_format)
-        else:
-            params = self.module.state_dict()
-            self.inference_engine.wake_up()
-            # TODO(ZSL): deal with 'hf' format
-            if load_format == 'dtensor':
-                from verl.third_party.vllm import load_dtensor_weights
-                load_dtensor_weights(
-                    params, self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model)
-            else:
-                raise NotImplementedError(f'load_format {load_format} not implemented')
-            del params
-        log_gpu_memory_usage('After load model weights in sharding manager', logger=logger)
-
+    def reload_fuse(self):
         torch.cuda.empty_cache()
-        log_gpu_memory_usage('After empty_cache in sharding manager', logger=logger)
 
-        # TODO: offload FSDP model weights
-        # self.module.cpu()
-        # torch.cuda.empty_cache()
-        # if torch.distributed.get_rank() == 0:
-        # print(f'after model to cpu in sharding manager memory allocated: {torch.cuda.memory_allocated() / 1e9}GB, reserved: {torch.cuda.memory_reserved() / 1e9}GB')
+        # Copy, not share memory
+        load_format = "hf" if self.full_params else "dtensor"
+
+        if vllm_version in (
+            "0.5.4",
+            "0.6.3",
+        ):
+            raise ValueError("When set fuse_enable to True, we only support vllm >= 0.7.0")
+        else:
+            if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                self.inference_engine.wake_up(tags=["weights"])
+            else:
+                self.inference_engine.wake_up()
+
+            torch.cuda.empty_cache()
+
+            if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                self.inference_engine.wake_up(tags=["kv_cache"])
+
+        log_gpu_memory_usage("After wake_up and empty_cache in sharding manager", logger=logger)
 
         # important: need to manually set the random states of each tp to be identical.
         if self.device_mesh is not None:
             self.torch_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.gen_random_states)
 
-    def exit(self):
-        log_gpu_memory_usage('Before vllm offload in sharding manager', logger=logger)
-        # TODO(ZSL): check this
-        if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
-            self.inference_engine.offload_model_weights()
+    def after_gen_fuse(self):
+        if vllm_version in (
+            "0.5.4",
+            "0.6.3",
+        ):
+            raise ValueError("When set fuse_enable to True, we only support vllm >= 0.7.0")
         else:
             self.inference_engine.sleep(level=1)
-        log_gpu_memory_usage('After vllm offload in sharding manager', logger=logger)
 
         # self.module.to('cuda')
         # if torch.distributed.get_rank() == 0:

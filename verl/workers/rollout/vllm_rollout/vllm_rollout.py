@@ -68,7 +68,7 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
 
 
 class vLLMRollout(BaseRollout):
-    def __init__(self, actor_module: nn.Module, config: DictConfig, tokenizer, model_hf_config, **kwargs):
+    def __init__(self, actor_module: nn.Module, config: DictConfig, tokenizer, model_hf_config, model_path: str, **kwargs):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
         Args:
@@ -118,27 +118,66 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
-        self.inference_engine = LLM(
-            actor_module,
-            tokenizer=tokenizer,
-            model_hf_config=model_hf_config,
-            tensor_parallel_size=tensor_parallel_size,
-            dtype=config.dtype,
-            enforce_eager=config.enforce_eager,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            skip_tokenizer_init=False,
-            max_model_len=max_model_len,
-            load_format=config.load_format,
-            disable_log_stats=config.disable_log_stats,
-            max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            partial_rollout_save_steps=config.partial_rollout_save_steps,
-            partial_rollout_mode=config.partial_rollout_mode,
-            **engine_kwargs,
-        )
+        if vllm_version in (
+                "0.5.4",
+                "0.6.3",
+            ):
+            self.inference_engine = LLM(
+                actor_module,
+                tokenizer=tokenizer,
+                model_hf_config=model_hf_config,
+                tensor_parallel_size=tensor_parallel_size,
+                dtype=config.dtype,
+                enforce_eager=config.enforce_eager,
+                gpu_memory_utilization=config.gpu_memory_utilization,
+                skip_tokenizer_init=False,
+                max_model_len=max_model_len,
+                load_format=config.load_format,
+                disable_log_stats=config.disable_log_stats,
+                max_num_batched_tokens=max_num_batched_tokens,
+                enable_chunked_prefill=config.enable_chunked_prefill,
+                partial_rollout_save_steps=config.partial_rollout_save_steps,
+                partial_rollout_mode=config.partial_rollout_mode,
+                **engine_kwargs,
+            )
+        else:
+            limit_mm_per_prompt = None
+            if config.get("limit_images", None):  # support for multi-image data
+                limit_mm_per_prompt = {"image": config.get("limit_images")}
+            load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+            trust_remote_code = kwargs.get("trust_remote_code", False)
+            self.inference_engine = LLM(
+                model=model_path,
+                enable_sleep_mode=True,
+                tensor_parallel_size=tensor_parallel_size,
+                distributed_executor_backend="external_launcher",
+                dtype=config.dtype,
+                enforce_eager=config.enforce_eager,
+                gpu_memory_utilization=config.gpu_memory_utilization,
+                disable_custom_all_reduce=True,
+                disable_mm_preprocessor_cache=True,
+                limit_mm_per_prompt=limit_mm_per_prompt,
+                skip_tokenizer_init=False,
+                max_model_len=max_model_len,
+                load_format=load_format,
+                disable_log_stats=config.disable_log_stats,
+                max_num_batched_tokens=max_num_batched_tokens,
+                enable_chunked_prefill=config.enable_chunked_prefill,
+                enable_prefix_caching=True,
+                trust_remote_code=trust_remote_code,
+                seed=config.get("seed", 0),
+                partial_rollout_save_steps=config.partial_rollout_save_steps,
+                partial_rollout_mode=config.partial_rollout_mode,
+            )
 
         # Offload vllm model to reduce peak memory usage
-        self.inference_engine.offload_model_weights()
+        if vllm_version in (
+                "0.5.4",
+                "0.6.3",
+            ):
+            self.inference_engine.offload_model_weights()
+        else:
+            self.inference_engine.sleep(level=1)
 
         kwargs = dict(
             n=1,
@@ -194,7 +233,15 @@ class vLLMRollout(BaseRollout):
             fuse_enable = prompts.meta_info['fuse_enable']
 
         # rebuild vllm cache engine
-        if self.config.free_cache_engine and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse'):
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+            and self.config.free_cache_engine
+            and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse')
+        ):
             self.inference_engine.init_cache_engine()
 
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
@@ -327,7 +374,15 @@ class vLLMRollout(BaseRollout):
             batch_size=batch_size)
 
         # free vllm cache engine
-        if self.config.free_cache_engine and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse'):
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+            and self.config.free_cache_engine
+            and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse')
+        ):
             self.inference_engine.free_cache_engine()
 
         np_batch = {}
@@ -361,7 +416,14 @@ class vLLMRollout(BaseRollout):
     @torch.no_grad()
     def generate_sequences_fused(self, prompts: DataProto, **kwargs) -> DataProto:
         # rebuild vllm cache engine
-        self.inference_engine.init_cache_engine()
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+        ):
+            self.inference_engine.init_cache_engine()
         
         idx = prompts.batch.pop('prompts')  # (bs, prompt_length)
         # left-padded attention_mask
@@ -400,7 +462,7 @@ class vLLMRollout(BaseRollout):
         output = self.inference_engine.generate(
             prompts=None,  # because we have already convert it to prompt token id
             sampling_params=[self.get_updated_sampling_params_fused(
-                max_tokens=self.sampling_params.max_tokens-int(old_response_length[i].item()),
+                max_tokens=self.sampling_params.max_tokens-1-int(old_response_length[i].item()),
                 n=1,
                 ) for i in range(batch_size)],
             prompt_token_ids=idx_list,
@@ -413,7 +475,7 @@ class vLLMRollout(BaseRollout):
         output_fused = output[3]
         
         # concat old responses and new response
-        new_response_attention_mask = get_eos_mask(response_id=new_response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        new_response_attention_mask = get_response_mask(response_id=new_response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         new_response_length = new_response_attention_mask.sum(-1).float()  # (batch_size,)
         
         new_response = new_response.tolist()
@@ -423,7 +485,7 @@ class vLLMRollout(BaseRollout):
                 torch.cat([torch.Tensor(old_responses[i]), torch.Tensor(new_response[i][:int(new_response_length[i].item())])], dim=0))
             
         response = pad_sequence(response, batch_first=True, padding_value=self.pad_token_id)
-        response = response.to(idx.device)
+        response = response.int().to(idx.device)
         
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
@@ -439,7 +501,7 @@ class vLLMRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
         
         batch_dict = {
@@ -456,7 +518,13 @@ class vLLMRollout(BaseRollout):
             batch_size=batch_size)
         
         # free vllm cache engine
-        if self.config.free_cache_engine and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse'):
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+        ):
             self.inference_engine.free_cache_engine()
         
         output_proto = DataProto(batch=batch)

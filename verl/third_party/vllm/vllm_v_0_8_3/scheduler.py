@@ -23,7 +23,9 @@ from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
 from vllm.core.interfaces import BlockSpaceManager
 from vllm.sequence import (Sequence, SequenceGroup,  SequenceStatus)
 from vllm.utils import PyObjectCache
-from vllm.core.scheduler import Scheduler
+from vllm.core.scheduler import (Scheduler, ENABLE_ARTIFICIAL_PREEMPT, 
+                                 ARTIFICIAL_PREEMPTION_MAX_CNT, seq_group_metadata_builder,
+                                 scheduler_running_outputs_builder, scheduled_seq_group_builder)
 
 class Scheduler(Scheduler):
     
@@ -272,3 +274,13 @@ class Scheduler(Scheduler):
                 
     def is_request_fused(self, request_id: str) -> bool:
         return (request_id in self.fused_request_ids)
+    
+    def get_request_num(self) -> int:
+        return len(self.running) + len(self.waiting) + len(self.swapped)
+    
+    def get_request_list(self) -> Deque[SequenceGroup]:
+        res: Deque[SequenceGroup] = deque()
+        res.extend(self.running)
+        res.extend(self.waiting)
+        res.extend(self.swapped)
+        return res

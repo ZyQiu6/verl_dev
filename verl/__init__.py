@@ -15,7 +15,7 @@
 import logging
 import os
 
-from .protocol import DataProto
+from .protocol import DataProto, DataProtoFuture
 from .utils.logging_utils import set_basic_config
 
 version_folder = os.path.dirname(os.path.join(os.path.abspath(__file__)))

@@ -19,6 +19,7 @@ import logging
 import os
 import warnings
 from typing import Union
+import time
 
 import psutil
 import torch
@@ -65,8 +66,11 @@ def create_device_mesh(world_size, fsdp_size):
         device_mesh = init_device_mesh("cuda", mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"])
     return device_mesh
 
-def create_fuse_fsdp_device_mesh(world_size, fsdp_size, group):
-    if fsdp_size < 0 or fsdp_size >= world_size:
+def create_fuse_fsdp_device_mesh(fsdp_size, group=None):
+    if not group:
+        return
+    
+    if fsdp_size < 0:
         import torch.distributed.device_mesh
         device_mesh = torch.distributed.device_mesh.DeviceMesh.from_group(group=group,
                                                                           device_type='cuda', 
@@ -100,9 +104,12 @@ class ActorRolloutRefWorker(Worker):
         super().__init__()
         self.config = config
         import torch.distributed
+        import ray
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group()
+            global_rank = torch.cuda.current_device()
+            # print(f"init_process_group count={torch.cuda.device_count()} ray={ray.get_gpu_ids()}, self.rank={self.rank}")
+            torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -231,6 +238,8 @@ class ActorRolloutRefWorker(Worker):
                 attn_implementation="flash_attention_2",
                 trust_remote_code=trust_remote_code,
             )
+            
+            print(f"actor_module.device={actor_module.device}")
 
             if use_remove_padding or self.ulysses_sequence_parallel_size > 1:
                 from verl.models.transformers.monkey_patch import apply_monkey_patch
@@ -295,7 +304,7 @@ class ActorRolloutRefWorker(Worker):
                 sharding_strategy=sharding_strategy,  # zero3
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
-                device_mesh=self.device_mesh,
+                device_mesh=fsdp_mesh,
                 forward_prefetch=False,
             )
         elif fsdp_strategy == "fsdp2":
@@ -316,7 +325,11 @@ class ActorRolloutRefWorker(Worker):
             }
             full_state = actor_module.state_dict()
             apply_fsdp2(actor_module, fsdp_kwargs, fsdp_config)
-            fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, cpu_offload)
+            if self._is_create_fuse_model:
+                group = self.actor_fsdp_fuse_pg
+            else:
+                group = None
+            fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, cpu_offload, group=group)
             actor_module_fsdp = actor_module
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
@@ -365,6 +378,8 @@ class ActorRolloutRefWorker(Worker):
         dp = self.world_size // infer_tp
         assert self.world_size % infer_tp == 0, f"rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}"
         rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
+        print(f"rollout_device_mesh={rollout_device_mesh}")
+        self.rollout_device_mesh = rollout_device_mesh
         rollout_name = self.config.rollout.name
         if rollout_name == "hf":
             from verl.workers.rollout import HFRollout
@@ -387,6 +402,7 @@ class ActorRolloutRefWorker(Worker):
                     tokenizer=self.tokenizer,
                     model_hf_config=self.actor_model_config,
                     trust_remote_code=trust_remote_code,
+                    model_path=local_path,
                 )
             elif vllm_mode == "spmd":
                 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
@@ -564,58 +580,72 @@ class ActorRolloutRefWorker(Worker):
         print(f"rank {self.rank}; global rank {global_rank} init_model done.")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def init_fuse_model(self, ranks=None):
-        global_rank = torch.distributed.get_rank()
-        print(f"rank {self.rank}; global rank {global_rank} init fsdp_fuse_pg")
-        self.fsdp_fuse_pg = torch.distributed.split_group(split_ranks=[ranks])
-        print(f"rank {self.rank}; global rank {global_rank} split_group")
-        torch.distributed.barrier()
+    def init_fuse_model(self, split_ranks=None):
+        import torch.distributed
 
-        if not self.rank in ranks:
-            return
+        self.actor_fsdp_fuse_pg = torch.distributed.split_group(split_ranks=split_ranks)
+
+        # inference ranks
         self._is_create_fuse_model = True
-        self.device_mesh_fuse = create_fuse_fsdp_device_mesh(world_size=self._train_world_size-self.config.rollout.tensor_model_parallel_size,
-                                                             fsdp_size=self.config.actor.fsdp_config.fsdp_size,
-                                                             group=self.fsdp_fuse_pg)
+        self.device_mesh_fuse = create_fuse_fsdp_device_mesh(fsdp_size=self.config.actor.fsdp_config.fsdp_size,
+                                                            group=self.actor_fsdp_fuse_pg)
         
-        from verl.workers.actor import DataParallelPPOActor
-        from omegaconf import OmegaConf
-        override_model_config = OmegaConf.to_container(self.config.model.get('override_config', OmegaConf.create()))
+        self.actor_inference_ranks = split_ranks[0]
 
-        use_remove_padding = self.config.model.get('use_remove_padding', False)
+        if self.rank in self.actor_inference_ranks:
+            from verl.workers.actor import DataParallelPPOActor
+            from omegaconf import OmegaConf
+            override_model_config = OmegaConf.to_container(self.config.model.get('override_config', OmegaConf.create()))
 
-        if self._is_actor or self._is_rollout:
-            # we need the model for actor and rollout
+            use_remove_padding = self.config.model.get('use_remove_padding', False)
+
+            # we need the model for actor
             if self._is_actor:
-                optim_config = self.config.actor.optim
-                fsdp_config = self.config.actor.fsdp_config
-            else:
                 optim_config = None
-                fsdp_config = OmegaConf.create()
-            self.actor_module_fsdp_fuse, self.actor_optimizer_fuse, self.actor_lr_scheduler_fuse, self.actor_model_config_fuse = self._build_model_optimizer(
-                model_path=self.config.model.path,
-                fsdp_config=fsdp_config,
-                optim_config=optim_config,
-                override_model_config=override_model_config,
-                use_remove_padding=use_remove_padding,
-                enable_gradient_checkpointing=self.config.model.get('enable_gradient_checkpointing', False),
-                trust_remote_code=self.config.model.get('trust_remote_code', False),
-                use_liger=self.config.model.get('use_liger', False),
-                role='actor')
+                fsdp_config = self.config.actor.fsdp_config
+                self.actor_module_fsdp_fuse, self.actor_optimizer_fuse, self.actor_lr_scheduler_fuse, self.actor_model_config_fuse = self._build_model_optimizer(
+                    model_path=self.config.model.path,
+                    fsdp_config=fsdp_config,
+                    optim_config=optim_config,
+                    override_model_config=override_model_config,
+                    use_remove_padding=use_remove_padding,
+                    enable_gradient_checkpointing=self.config.model.get('enable_gradient_checkpointing', False),
+                    trust_remote_code=self.config.model.get('trust_remote_code', False),
+                    use_liger=self.config.model.get('use_liger', False),
+                    role='actor')
 
-            if self._is_offload_param:
-                # param is require during state_dict in sharding manager
-                offload_fsdp_grad(module=self.actor_module_fsdp_fuse)
-                log_gpu_memory_usage('After offload actor grad during init', logger=logger)
-            if self._is_offload_optimizer:
-                offload_fsdp_optimizer(optimizer=self.actor_optimizer_fuse)
-                log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
-        
-        if self._is_actor:
-            self.actor_fuse = DataParallelPPOActor(config=self.config.actor,
-                                              actor_module=self.actor_module_fsdp_fuse,
-                                              actor_optimizer=self.actor_optimizer_fuse)
+                if self._is_offload_param:
+                    # param is require during state_dict in sharding manager
+                    offload_fsdp_model_to_cpu(self.actor_module_fsdp_fuse)
+                    log_gpu_memory_usage('After offload actor grad during init', logger=logger)
+                # if self._is_offload_optimizer:
+                #     offload_fsdp_optimizer(optimizer=self.actor_optimizer_fuse)
+                #     log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
             
+                self.actor_fuse = DataParallelPPOActor(config=self.config.actor,
+                                                       actor_module=self.actor_module_fsdp_fuse,
+                                                       actor_optimizer=self.actor_optimizer_fuse)
+            
+            # ref fuse
+            if self._is_ref:
+                self.ref_module_fsdp_fuse = self._build_model_optimizer(
+                    model_path=self.config.model.path,
+                    fsdp_config=self.config.ref.fsdp_config,
+                    optim_config=None,
+                    override_model_config=override_model_config,
+                    use_remove_padding=use_remove_padding,
+                    trust_remote_code=self.config.model.get("trust_remote_code", False),
+                    use_liger=self.config.model.get("use_liger", False),
+                    role="ref",
+                )[0]
+                self.ref_policy_fuse = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+                if self._is_offload_param:
+                    # param is require during state_dict in sharding manager
+                    offload_fsdp_model_to_cpu(self.ref_module_fsdp_fuse)
+                    log_gpu_memory_usage('After offload ref grad during init', logger=logger)
+        else:
+            torch.distributed.barrier()
+        
         torch.cuda.empty_cache()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -699,88 +729,66 @@ class ActorRolloutRefWorker(Worker):
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def generate_sequences_offline(self, prompts: DataProto):
-        prompts = prompts.to('cuda')
+        # Support all hardwares
+        prompts = prompts.to(torch.cuda.current_device())
 
         assert self._is_rollout
-        if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
 
-        prompts.batch = prompts.batch.cuda()
         meta_info = {
-            'eos_token_id':
-                self.generation_config.eos_token_id
-                if self.generation_config is not None else self.tokenizer.eos_token_id,
-            'pad_token_id':
-                self.generation_config.pad_token_id
-                if self.generation_config is not None else self.tokenizer.pad_token_id,
+            "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
+        print(f"{self.rank} starts generation")
         with self.rollout_sharding_manager:
-            log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+            log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
 
-            log_gpu_memory_usage('After rollout generation', logger=logger)
+            if self.config.rollout.name == "sglang_async":
+                from verl.workers.rollout.sglang_rollout import AsyncSGLangRollout
+
+                if isinstance(self.rollout, AsyncSGLangRollout) and hasattr(self.rollout, "_tool_schemas") and len(self.rollout._tool_schemas) > 0:
+                    output = self.rollout.generate_sequences_with_tools(prompts=prompts)
+                else:
+                    output = self.rollout.generate_sequences(prompts=prompts)
+            else:
+                output = self.rollout.generate_sequences(prompts=prompts)
+            log_gpu_memory_usage("After rollout generation", logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
 
-        output = output.to('cpu')
+        output = output.to("cpu")
 
-        if self._is_offload_param:
-            # NOTE(sgm): the grad is already in CPU, only offload param here
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
         # clear kv cache
         torch.cuda.empty_cache()
-        log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
     
-    @register(dispatch_mode=Dispatch.TP_ONE_TO_ALL_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
+    @register(dispatch_mode=Dispatch.TP_ONE_TO_ALL_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED, blocking=False)
     def generate_sequences_fused(self, prompts: DataProto, ranks=None):
         print("generate_sequences_fused begin")
-        prompts = prompts.to('cuda')
+        prompts = prompts.to(torch.cuda.current_device())
 
         assert self._is_rollout
-        if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
 
-        
-        print("load_fsdp_param_and_grad end")
-        prompts.batch = prompts.batch.cuda()
         meta_info = {
-            'eos_token_id':
-                self.generation_config.eos_token_id
-                if self.generation_config is not None else self.tokenizer.eos_token_id,
-            'pad_token_id':
-                self.generation_config.pad_token_id
-                if self.generation_config is not None else self.tokenizer.pad_token_id,
+            "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        print("rollout_sharding_manager begin")
         
-        self.rollout_sharding_manager.reload()
-        print("rollout_sharding_manager end")
-        log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+        self.rollout_sharding_manager.reload_fuse()
+        log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
         output = self.rollout.generate_sequences_fused(prompts=prompts)
-        log_gpu_memory_usage('After rollout generation', logger=logger)
+        log_gpu_memory_usage("After rollout generation", logger=logger)
 
-        # output = self.rollout_sharding_manager.postprocess_data(output)
-        self.rollout_sharding_manager.exit()
+        self.rollout_sharding_manager.after_gen_fuse()
 
-        output = output.to('cpu')
+        output = output.to("cpu")
 
-        if self._is_offload_param:
-            # NOTE(sgm): the grad is already in CPU, only offload param here
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
         # clear kv cache
         torch.cuda.empty_cache()
-        log_gpu_memory_usage('After recompute log prob', logger=logger)
-        print("generate_sequences_fused end")
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -788,6 +796,7 @@ class ActorRolloutRefWorker(Worker):
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        print("compute_log_prob")
 
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
@@ -819,37 +828,39 @@ class ActorRolloutRefWorker(Worker):
 
         return output
     
-    @register(dispatch_mode=Dispatch.TP_ONE_TO_ALL_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
     def compute_log_prob_fused(self, data: DataProto, ranks=None):
         assert self._is_actor
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
-        data = data.to('cuda')
+            load_fsdp_model_to_gpu(self.actor_module_fsdp_fuse)
+        print("compute_log_prob_fused")
+        # Support all hardwares
+        data = data.to(torch.cuda.current_device())
         # we should always recompute old_log_probs when it is HybridEngine
-        data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
-        data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
-        data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
-        data.meta_info['temperature'] = self.config.rollout.temperature
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.actor_fused.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'old_log_probs': output},
-                                         meta_info={'temperature': self.config.rollout.temperature})
+            output, entropys = self.actor_fuse.compute_log_prob(data=data, calculate_entropy=True)
+            output = DataProto.from_dict(
+                tensors={"old_log_probs": output, "entropys": entropys},
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to('cpu')
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1:
-            self.actor.actor_module._handle.reshard(True)
+        if len(self.actor_inference_ranks) > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor_fuse.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
-            # NOTE(sgm): the grad is already in CPU, only offload param here
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp_fuse)
+            log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
         # clear kv cache
         torch.cuda.empty_cache()
@@ -883,9 +894,11 @@ class ActorRolloutRefWorker(Worker):
 
         return output
     
-    @register(dispatch_mode=Dispatch.TP_ONE_TO_ALL_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
     def compute_ref_log_prob_fused(self, data: DataProto, ranks=None):
         assert self._is_ref
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.ref_module_fsdp_fuse)
 
         data = data.to('cuda')
 
@@ -904,8 +917,11 @@ class ActorRolloutRefWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1:
+        if len(self.actor_inference_ranks) > 1:
             self.ref_policy_fused.actor_module._handle.reshard(True)
+        
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.ref_module_fsdp_fuse)
 
         torch.cuda.empty_cache()
         return output
@@ -956,68 +972,98 @@ class ActorRolloutRefWorker(Worker):
         return a, b, c
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def sync_rollout_model_weights(self, model_weights: dict):
-        self.rollout_sharding_manager.sync_rollout_model_weights(model_weights)
-        
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_fuse_actor_model_weights(self):
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            
+        params = self.actor_module_fsdp.state_dict()
+        device = torch.cuda.current_device()
+        actor_module_weights = {name: param.to(device, non_blocking=True).full_tensor() if self.world_size != 1 and hasattr(param, "full_tensor") else param for name, param in params.items()}
+        if self.rank in self.actor_inference_ranks:
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp_fuse)
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
+
+            FSDP.set_state_dict_type(
+                self.actor_module_fsdp_fuse,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+                FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True),
+            )
+            self.actor_module_fsdp_fuse.load_state_dict(actor_module_weights)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp_fuse)
+        del params, actor_module_weights
+            
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_actor_model_weights(self, model_weights: dict):
-        self.actor_module_fsdp.load(model_weights)
-        
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            
+        fsdp_strategy = self.config.actor.strategy
+        if fsdp_strategy == 'fsdp':
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+            
+            with FSDP.state_dict_type(
+                self.actor_module_fsdp,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True),
+                FullOptimStateDictConfig(offload_to_cpu=True),
+            ):
+                self.actor_module_fsdp.load_state_dict(model_weights)
+                # for k, v in model_weights.items():
+                #     if isinstance(v, torch.Tensor):
+                #         model_weights[k] = v.to(f"cuda:{torch.cuda.current_device()}")
+                # set_model_state_dict(self.actor_module_fsdp, model_weights, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        elif fsdp_strategy == 'fsdp2':
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+            
+            cpu_offload= None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
+            fsdp2_load_full_state_dict(self.actor_module_fsdp, model_weights, cpu_offload=cpu_offload)
+        torch.distributed.barrier()
+            
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ALL_TO_ONE)
     def get_actor_model_weights(self):
         # only support actor
         assert self._is_actor
-        import torch
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
         from torch.distributed._tensor import DTensor
+
+        # model_state_dict = self.actor_module_fsdp.state_dict()
+        # begin_time = time.time()
+        # for k, v in model_state_dict.items():
+        #     model_state_dict[k] = v.full_tensor()
+        # for k, v in model_state_dict.items():
+        #     model_state_dict[k] = model_state_dict[k].to("cpu")
+        # print(f"to cpu time={time.time()-begin_time}")
+
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
+        begin_time = time.time()
         
-        if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+        with FSDP.state_dict_type(
+            self.actor_module_fsdp,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+            FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True),
+        ):
+            model_state_dict = self.actor_module_fsdp.state_dict()
+        print(f"state_dict_type time={time.time()-begin_time}")
 
-        model_state_dict = self.actor_module_fsdp.state_dict()
-        for k, v in model_state_dict.items():
-            if isinstance(v, DTensor):
-                v = v.full_tensor()
-                model_state_dict[k] = v.cpu()
-
-        torch.distributed.barrier()
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
-            
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         return model_state_dict
-    
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def get_ref_model_weights(self):
-        # only support actor
-        assert self._is_actor
-        import torch
-        from torch.distributed._tensor import DTensor
-        
-        if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
-
-        model_state_dict = self.ref_module_fsdp.state_dict()
-        for k, v in model_state_dict.items():
-            if isinstance(v, DTensor):
-                v = v.full_tensor()
-                model_state_dict[k] = v.cpu()
-
-        torch.distributed.barrier()
-        if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
-            
-        return model_state_dict
-    
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def sync_actor_model_weights_fused(self, model_weights: dict):
-        self.rollout_sharding_mnaager.sync_rollout_model_weights(model_weights)
-        
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def sync_ref_model_weights_fused(self, model_weights: dict):
-        self.rollout_sharding_mnaager.sync_rollout_model_weights(model_weights)
 
 class CriticWorker(Worker):
     def __init__(self, config):
@@ -1025,7 +1071,7 @@ class CriticWorker(Worker):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
+            torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
         self.config = config
 
         # build device mesh for Ulysses Sequence Parallel
@@ -1059,6 +1105,7 @@ class CriticWorker(Worker):
         if self.config.ppo_micro_batch_size_per_gpu is not None:
             assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
             assert self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu > 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
+        self._is_create_fuse_model = False
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
@@ -1122,6 +1169,7 @@ class CriticWorker(Worker):
 
             if config.model.get("enable_gradient_checkpointing", False):
                 critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        torch.distributed.barrier()
         if self.rank == 0:
             print_model_size(critic_module)
 
@@ -1144,7 +1192,7 @@ class CriticWorker(Worker):
 
         log_gpu_memory_usage("Before critic FSDP", logger=None)
 
-        fsdp_mesh = self.device_mesh
+        fsdp_mesh = self.device_mesh if not self._is_create_fuse_model else self.device_mesh_fuse
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
         # Note: We force turn off CPUOffload for critic because it causes incorrect results when using grad accumulation
@@ -1159,7 +1207,7 @@ class CriticWorker(Worker):
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
                 forward_prefetch=False,
-                device_mesh=self.device_mesh,
+                device_mesh=fsdp_mesh,
                 cpu_offload=None,
             )
         elif config.strategy == "fsdp2":
@@ -1179,18 +1227,27 @@ class CriticWorker(Worker):
             }
             full_state = critic_module.state_dict()
             apply_fsdp2(critic_module, fsdp_kwargs, fsdp_config)
-            fsdp2_load_full_state_dict(critic_module, full_state, fsdp_mesh, offload_policy)
+            if self._is_create_fuse_model:
+                group = self.critic_fsdp_fuse_pg
+            else:
+                group = None
+            fsdp2_load_full_state_dict(critic_module, full_state, fsdp_mesh, offload_policy, group=group)
+            print("fsdp2_load_full_state_dict end")
         else:
             raise NotImplementedError(f"Unknown strategy {config.strategy}")
 
         log_gpu_memory_usage("After critic FSDP", logger=None)
 
-        critic_optimizer = optim.AdamW(
-            critic_module.parameters(),
-            lr=config.optim.lr,
-            betas=config.optim.get("betas", (0.9, 0.999)),
-            weight_decay=config.optim.get("weight_decay", 1e-2),
-        )
+        if self._is_create_fuse_model:
+            critic_optimizer = None
+        else:
+            critic_optimizer = optim.AdamW(
+                critic_module.parameters(),
+                lr=config.optim.lr,
+                betas=config.optim.get("betas", (0.9, 0.999)),
+                weight_decay=config.optim.get("weight_decay", 1e-2),
+            )
+            
 
         total_steps = config.optim.get("total_training_steps", 0)
         num_warmup_steps = int(config.optim.get("lr_warmup_steps", -1))
@@ -1203,7 +1260,9 @@ class CriticWorker(Worker):
 
         from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-        if warmup_style == "constant":
+        if self._is_create_fuse_model:
+            critic_lr_scheduler = None
+        elif warmup_style == "constant":
             critic_lr_scheduler = get_constant_schedule_with_warmup(optimizer=critic_optimizer, num_warmup_steps=num_warmup_steps)
         elif warmup_style == "cosine":
             critic_lr_scheduler = get_cosine_schedule_with_warmup(optimizer=critic_optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps)
@@ -1239,10 +1298,41 @@ class CriticWorker(Worker):
             checkpoint_contents=self.config.checkpoint.contents,
         )
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_fuse_model(self, split_ranks=None):
+        import torch.distributed
+        
+        global_rank = torch.distributed.get_rank()
+        self.critic_fsdp_fuse_pg = torch.distributed.split_group(split_ranks=split_ranks)
+
+        # inference ranks
+        self._is_create_fuse_model = True
+        self.device_mesh_fuse = create_fuse_fsdp_device_mesh(fsdp_size=self.config.model.fsdp_config.fsdp_size,
+                                                            group=self.critic_fsdp_fuse_pg)
+        
+        self.critic_inference_ranks = split_ranks[0]
+
+        if self.rank in self.critic_inference_ranks:
+            from verl.workers.critic import DataParallelPPOCritic
+
+            self.critic_module_fuse, self.critic_optimizer_fuse, self.critic_lr_scheduler_fuse = self._build_critic_model_optimizer(self.config)
+
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.critic_module_fuse)
+                log_gpu_memory_usage("After offload fuse critic model during init", logger=logger)
+            # if self._is_offload_optimizer:
+            #     offload_fsdp_optimizer(optimizer=self.critic_optimizer_fuse)
+            #     log_gpu_memory_usage("After offload fuse critic optimizer during init", logger=logger)
+
+            self.critic_fuse = DataParallelPPOCritic(config=self.config, critic_module=self.critic_module_fuse, critic_optimizer=self.critic_optimizer_fuse)
+        else:
+            torch.distributed.barrier()
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
+        print("compute_values")
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
@@ -1262,29 +1352,29 @@ class CriticWorker(Worker):
             offload_fsdp_model_to_cpu(self.critic_module)
         return output
     
-    @register(dispatch_mode=Dispatch.TP_ONE_TO_ALL_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
     def compute_values_fused(self, data: DataProto, ranks=None):
-        data = data.to('cuda')
+        assert self.rank in self.critic_inference_ranks, f"Worker rank {self.rank} not in critic_inference_ranks {self.critic_inference_ranks}"
+        
+        # Support all hardwares
+        data = data.to(torch.cuda.current_device())
 
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.critic_module,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.critic_module_fuse)
         micro_batch_size = self.config.forward_micro_batch_size_per_gpu
-        data.meta_info['micro_batch_size'] = micro_batch_size
-        data.meta_info['max_token_len'] = self.config.forward_max_token_len_per_gpu
-        data.meta_info['use_dynamic_bsz'] = self.config.use_dynamic_bsz
+        data.meta_info["micro_batch_size"] = micro_batch_size
+        data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         # perform forward computation
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
-            values = self.critic.compute_values(data=data)
-            output = DataProto.from_dict(tensors={'values': values})
+            values = self.critic_fuse.compute_values(data=data)
+            output = DataProto.from_dict(tensors={"values": values})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
         output = output.to('cpu')
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
-        torch.cuda.empty_cache()
+            offload_fsdp_model_to_cpu(self.critic_module_fuse)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -1314,12 +1404,15 @@ class CriticWorker(Worker):
 
             output = DataProto(batch=None, meta_info={"metrics": metrics})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            
+            # critic_model_weights = self.critic_module.state_dict()
+            # if self.rank == 0:
+            #     output.meta_info.update({'critic_model_weights': critic_model_weights,})
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
-
         output = output.to("cpu")
         return output
 
@@ -1357,29 +1450,56 @@ class CriticWorker(Worker):
         a,b,c= self.flops_counter.estimate_flops_critic(prompt_length, response_length, delta_time)
         return a, b, c
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @register(dispatch_mode=Dispatch.ALL_TO_ONE)
     def get_critic_model_weights(self):
         import torch
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.critic_module,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.critic_module)
+            
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
 
-        model_state_dict = self.critic_module.state_dict()
-        for k, v in model_state_dict.items():
-            if isinstance(v, DTensor):
-                v = v.full_tensor()
-                model_state_dict[k] = v.cpu()
+        with FSDP.state_dict_type(
+            self.critic_module,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+            FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True),
+        ):
+            model_state_dict = self.critic_module.state_dict()
 
         torch.distributed.barrier()
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
+            offload_fsdp_model_to_cpu(self.critic_module)
             
         return model_state_dict
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def sync_critic_model_weights(self, model_weights: dict):
-        self.critic_module.load(model_weights)
+    def sync_fuse_critic_model_weights(self):
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.critic_module)
+            
+        params = self.critic_module.state_dict()
+        device = torch.cuda.current_device()
+        critic_module_weights = {name: param.to(device, non_blocking=True).full_tensor() if self.world_size != 1 and hasattr(param, "full_tensor") else param for name, param in params.items()}
+        if self.rank in self.critic_inference_ranks:
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.critic_module_fuse)
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
+
+            FSDP.set_state_dict_type(
+                self.critic_module_fuse,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+                FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True),
+            )
+            self.critic_module_fuse.load_state_dict(critic_module_weights)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.critic_module_fuse)
+        del params, critic_module_weights
+            
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.critic_module)
 
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py

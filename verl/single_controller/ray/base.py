@@ -387,10 +387,10 @@ class RayWorkerGroup(WorkerGroup):
         if all(isinstance(arg, list) for arg in args) and all(isinstance(kwarg, list) for kwarg in kwargs.values()):
             if all(len(arg) == length for arg in args) and all(len(kwarg) == length for kwarg in kwargs.values()):
                 result = []
-                for i in ranks:
+                for i in range(length):
                     sliced_args = tuple(arg[i] for arg in args)
                     sliced_kwargs = {k: v[i] for k, v in kwargs.items()}
-                    remote_call = getattr(self._workers[i], method_name)
+                    remote_call = getattr(self._workers[ranks[i]], method_name)
                     result.append(remote_call.remote(*sliced_args, **sliced_kwargs))
                 return result
         return [getattr(self._workers[rank], method_name).remote(*args, **kwargs) for rank in ranks]
@@ -450,7 +450,8 @@ class RayWorkerGroup(WorkerGroup):
                     result.append(self._execute_remote_single_worker(self._workers[i], method_name, *sliced_args, **sliced_kwargs))
                 return result
 
-        return [self._execute_remote_single_worker(worker, method_name, *args, **kwargs) for worker in self._workers]
+        result = [self._execute_remote_single_worker(worker, method_name, *args, **kwargs) for worker in self._workers]
+        return result
 
     @property
     def master_address(self):
