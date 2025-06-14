@@ -23,7 +23,7 @@ import os
 import uuid
 import time
 import asyncio
-from asyncio import Lock
+import threading
 from collections import defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
@@ -64,6 +64,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
+from verl.utils.store_buffer import StoreBuffer
 
 WorkerType = Type[Worker]
 
@@ -349,7 +350,7 @@ class RayPPOTrainer:
 
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
-        assert real_train_batch_size % n_gpus == 0, f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
+        # assert real_train_batch_size % n_gpus == 0, f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
 
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
         # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
@@ -460,7 +461,7 @@ class RayPPOTrainer:
         Creates the train and validation dataloaders.
         """
         # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
+        from verl.trainer.main_ppo_offpolicy import create_rl_dataset, create_rl_sampler
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizer, self.processor)
@@ -612,12 +613,13 @@ class RayPPOTrainer:
                 "recompute_log_prob": False,
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
+                "partial_rollout_enable": False,
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.rollout_wg.world_size)
-            test_output_gen_batch_padded = self.rollout_wg.generate_sequences(test_gen_batch_padded)
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_wg.world_size)
+            test_output_gen_batch_padded = self.actor_wg.generate_sequences(test_gen_batch_padded)
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print("validation generation end")
@@ -852,32 +854,27 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
-    async def gen_and_store_rollout(self, batch: DataProto, future: DataProtoFuture,
-                                    timing_raw, partial_rollout_enable, metrics):
+    async def gen_and_store_rollout(self, batch: DataProto, future: DataProtoFuture, partial_rollout_enable=False,
+                                    extra_info={}):
         still_running = future.futures
         while len(still_running) > 0:
-            finished, still_running = ray.wait(still_running)
+            finished, still_running = ray.wait(still_running, num_returns=len(still_running))
         gen_batch_output = future.get()
-        print(f"gen_and_store_rollout future get")
-
-        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                    dtype=object)
 
         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-            with _timer("gen_max", timing_raw):
-                gen_baseline_batch = deepcopy(gen_batch)
-                gen_baseline_batch.meta_info["do_sample"] = False
-                gen_baseline_output = self.rollout_wg.generate_sequences(gen_baseline_batch)
+            gen_baseline_batch = deepcopy(gen_batch_output)
+            gen_baseline_batch.meta_info["do_sample"] = False
+            gen_baseline_output = self.rollout_wg.generate_sequences(gen_baseline_batch)
 
-                batch = batch.union(gen_baseline_output)
-                reward_baseline_tensor = self.reward_fn(batch)
-                reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+            batch = batch.union(gen_baseline_output)
+            reward_baseline_tensor = self.reward_fn(batch)
+            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
-                batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
-                batch.batch["reward_baselines"] = reward_baseline_tensor
+            batch.batch["reward_baselines"] = reward_baseline_tensor
 
-                del gen_baseline_batch, gen_baseline_output
+            del gen_baseline_batch, gen_baseline_output
 
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -888,6 +885,7 @@ class RayPPOTrainer:
             if len(self.replay_buffer) > 0:
                 batch = DataProto.concat([self.replay_buffer, batch])
                 self.replay_buffer = DataProto()
+            batch = DataProto.reorder_by_responding_element([batch], gen_batch_output, "uid")[0]
             selected_replay_index = []
             finished_index = []
             for index, finished in enumerate(output_finished.tolist()):
@@ -896,37 +894,38 @@ class RayPPOTrainer:
                 else:
                     selected_replay_index.append(index)
             batch, self.replay_buffer = DataProto.separate_by_index(batch, finished_index, selected_replay_index)
+            _ = gen_batch_output.non_tensor_batch.pop("uid") # pop uid to avoid other bugs
             gen_batch_output, gen_replay_buffer = DataProto.separate_by_index(gen_batch_output, finished_index, selected_replay_index)
 
         batch = batch.union(gen_batch_output)
         
         batch.batch["response_mask"] = compute_response_mask(batch)
-        # balance the number of valid tokens on each dp rank.
-        # Note that this breaks the order of data inside the batch.
-        # Please take care when you implement group based adv computation such as GRPO and rloo
-        self._balance_batch(batch, metrics=metrics)
 
         # compute global_valid tokens
         batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
         
-        # async with self.lock:
-        if len(self.store_buffer) > 0:
-            self.store_buffer = DataProto.concat([batch, store_buffer])
-        else:
-            self.store_buffer = deepcopy(batch)
+        info = {}
+        if "version" in extra_info:
+            version = extra_info["version"]
+            info["version"] = np.full(len(batch), version)
+            print(f"Generation version {version}")
+        self.lock.acquire()
+        self.store_buffer.add(batch, info)
+        self.lock.release()
         
         print(f"Gen store_buffer length: {len(self.store_buffer)}")
         return
             
-    async def update(self, timing_raw, total_ops, metrics) -> DataProto:
+    async def update(self, timing_raw, total_ops, metrics, config={}, stop_flag=False) -> DataProto:
         train_batch_size = self.config.data.train_batch_size
-        while len(self.store_buffer) < train_batch_size:
-            continue
-        # async with self.lock:
-        # TODO: select rollouts to update actor
-        select_index = [i for i in range(train_batch_size)]
-        replay_index = [i for i in range(train_batch_size, len(self.store_buffer))]
-        batch, self.store_buffer = DataProto.separate_by_index(self.store_buffer, select_index, replay_index)
+        batch = DataProto()
+        while len(batch) < train_batch_size:
+            self.lock.acquire()
+            batch, _ = self.store_buffer.select(train_batch_size, config)
+            self.lock.release()
+        
+        if stop_flag:
+            self.stop_event.set()
         
         with _timer("reward", timing_raw):
             # compute reward model score
@@ -964,6 +963,8 @@ class RayPPOTrainer:
                 batch = batch.union(values)
 
         with _timer("adv", timing_raw):
+            if self.config.trainer.balance_batch:
+                self._balance_batch(batch, metrics=metrics)
             # we combine with rule-based rm
             reward_extra_infos_dict: dict[str, list]
             if self.config.reward_model.launch_reward_fn_async:
@@ -1032,6 +1033,49 @@ class RayPPOTrainer:
         asyncio.set_event_loop(loop)
         loop.run_forever()
 
+    def process_input(self, batch_dict: dict, partial_rollout_enable=False):
+        batch: DataProto = DataProto.from_single_dict(batch_dict)
+                    
+        # pop those keys for generation
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+        if "multi_modal_inputs" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
+        if "raw_prompt" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("raw_prompt")
+        if "tools_kwargs" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("tools_kwargs")
+
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+        )
+        gen_batch.meta_info.update({
+            'partial_rollout_enable': partial_rollout_enable,
+        })
+        
+        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                    dtype=object)
+        gen_batch.non_tensor_batch['uid'] = deepcopy(batch.non_tensor_batch['uid'])
+        
+        return batch, gen_batch
+
+    def continuous_gen(self, gen_loop, stop_event):
+        partial_rollout_enable = False
+        if self.config.actor_rollout_ref.rollout.partial_rollout_save_steps:
+            partial_rollout_enable = True
+        
+        while not stop_event.is_set():
+            self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
+            batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
+            gen_obj_ref = self.rollout_wg.generate_sequences_offline(gen_batch)
+
+            extra_info = {"version": self.global_steps}
+            future = asyncio.run_coroutine_threadsafe(self.gen_and_store_rollout(batch, gen_obj_ref,
+                                                        partial_rollout_enable, extra_info), gen_loop)
+            _ = future.result()
+            
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1072,107 +1116,141 @@ class RayPPOTrainer:
         self.global_steps += 1
         
         self.replay_buffer: DataProto = DataProto()
-        self.store_buffer: DataProto = DataProto()
+        self.store_buffer: StoreBuffer = StoreBuffer(DataProto(), {})
         
-        batch_list: list = []
-        gen_obj_ref_list: list = []
-        metrics_list: list = []
-        timing_raw_list: list = []
+        # batch_list: list = []
+        # gen_obj_ref: list = []
+        self.gen_batch_index = 0
         
         last_val_metrics = None
         
         begin_timestamp = time.time()
         
         partial_rollout_enable = False
-        # if self.config.actor_rollout_ref.rollout.partial_rollout_save_steps:
-        #     partial_rollout_enable = True
+        if self.config.actor_rollout_ref.rollout.partial_rollout_save_steps:
+            partial_rollout_enable = True
+        
+        # for asyncio
+        # gen_loop = None
+        # switch_loop = None
+        # switch_obj_ref = None
+        
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        
+        self.training_datas = [batch_dict for batch_dict in self.train_dataloader]
         
         while True:
-            # FIXME: add param k to config
-            # k = int(len(metrics_list) // 2)
-            k = 2
-            
-            range_min = (k * (self.global_steps - 1)) % len(self.train_dataloader)
-            range_max = range_min + k * 2
-            cnt = 0
-            while cnt < range_max:
-                for index, batch_dict in enumerate(self.train_dataloader):
-                    cnt += 1
-                    if cnt < range_min:
-                        continue
-                    elif cnt >= range_max:
-                        break
-                    batch: DataProto = DataProto.from_single_dict(batch_dict)
+            k = self.config.trainer.offpolicy_sync_freq
+
+            # while cnt < range_max:
+            #     for index, batch_dict in enumerate(self.train_dataloader):
+            #         cnt += 1
+            #         if cnt < range_min:
+            #             continue
+            #         elif cnt > range_max:
+            #             break
                     
-                    # pop those keys for generation
-                    batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                    non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                    if "multi_modal_inputs" in batch.non_tensor_batch:
-                        non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
-                    if "raw_prompt" in batch.non_tensor_batch:
-                        non_tensor_batch_keys_to_pop.append("raw_prompt")
-                    if "tools_kwargs" in batch.non_tensor_batch:
-                        non_tensor_batch_keys_to_pop.append("tools_kwargs")
+            #         batch, gen_batch = self.process_input(batch_dict, partial_rollout_enable)
 
-                    is_last_step = self.global_steps >= self.total_training_steps
-
-                    gen_batch = batch.pop(
-                        batch_keys=batch_keys_to_pop,
-                        non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                    )
-                    gen_batch.meta_info.update({
-                        'partial_rollout_enable': partial_rollout_enable,
-                    })
-
-                    # generate a batch
-                    batch_list.append(batch)
-                    gen_obj_ref_list.append(self.rollout_wg.generate_sequences_offline(gen_batch))
-                    metrics_list.append({})
-                    timing_raw_list.append({})
+            #         # generate a batch
+            #         batch_list.append(batch)
+            #         gen_obj_ref_list.append(self.rollout_wg.generate_sequences_offline(gen_batch))
             
-            new_loop = asyncio.new_event_loop()
-            t = Thread(target=self.start_thread_loop, args=(new_loop,))
-            t.start()
+            gen_loop = asyncio.new_event_loop()
+            gen_thread = Thread(target=self.start_thread_loop, args=(gen_loop,))
+            gen_thread.start()
+            
+            continuous_thread = threading.Thread(
+                target=self.continuous_gen,
+                args=(gen_loop, self.stop_event),
+                daemon=True
+            )
+            continuous_thread.start()
 
-            # self.lock = Lock()
-            for index in range(len(gen_obj_ref_list)):
-                asyncio.run_coroutine_threadsafe(self.gen_and_store_rollout(batch_list[index], gen_obj_ref_list[index], 
-                                                                            timing_raw_list[index], partial_rollout_enable, 
-                                                                            metrics_list[index]), new_loop)
+            # for index in range(len(gen_obj_ref_list)):
+            #     extra_info = {"version": self.global_steps}
+            #     asyncio.run_coroutine_threadsafe(self.gen_and_store_rollout(batch_list[index], gen_obj_ref_list[index],
+            #                                                                 partial_rollout_enable, extra_info), gen_loop)
             
             for index in range(k):
-                metrics = metrics_list[index]
-                timing_raw = timing_raw_list[index]
+                is_last_step = self.global_steps >= self.total_training_steps
+
+                metrics = {}
+                timing_raw = {}
                 total_ops = 0
 
                 with _timer('step', timing_raw):
                     print(f'Step: {self.global_steps}')
 
                     loop = asyncio.new_event_loop()
-                    task = loop.create_task(self.update(timing_raw, total_ops, metrics))
+                    config = {
+                        "method": 'm_ratio_new',
+                        # "method": 'naive',
+                        "version_ratio": {"version": self.global_steps-index, "ratio": 0.9},
+                    }
+                    task = loop.create_task(self.update(timing_raw, total_ops, metrics, config, stop_flag=(index == k-1)))
                     loop.run_until_complete(task)
                     batch = task.result()
                     loop.close()
-                    # batch = self.update(timing_raw, total_ops, metrics)
 
-                    # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
-                        with _timer("testing", timing_raw):
-                            val_metrics: dict = self._validate()
-                            if is_last_step:
-                                last_val_metrics = val_metrics
-                        metrics.update(val_metrics)
-
-                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                        with _timer("save_checkpoint", timing_raw):
-                            self._save_checkpoint()
-                
-                if index == k - 1:
-                    with _timer("sync_generation_policy", timing_raw):
-                        # sync model weights
-                        model_weights = self.actor_wg.get_actor_model_weights()
-                        self.rollout_wg.sync_actor_model_weights(model_weights)
+                    if index == k - 1:
+                        with _timer("sync_generation_policy", timing_raw):
+                            # cancel uncompleted generation tasks
+                            gen_loop.stop()
+                            # for index in range(len(gen_obj_ref_list)):
+                            #     if len(ray.wait(gen_obj_ref_list[index].futures)[0]) == 0:
+                            #         for obj_ref in gen_obj_ref_list[index].futures:
+                            #             ray.cancel(obj_ref)
+                            # self.stop_event.set()
                             
+                            # sync model weights
+                            model_weights = self.actor_wg.get_actor_model_weights()
+                            sync_running = self.rollout_wg.sync_actor_model_weights(model_weights)
+                            # switch role
+                            if self.config.trainer.switch_role:
+                                switch_loop = asyncio.new_event_loop()
+                            switch_obj_ref = None
+                            while len(sync_running) > 0:
+                                if self.config.trainer.switch_role:
+                                    extra_info = {"version": self.global_steps+1,}
+                                    self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
+                                    batch_switch, gen_batch_switch = self.process_input(self.training_datas[self.gen_batch_index])
+                                    switch_obj_ref = self.actor_wg.generate_sequences_offline(gen_batch_switch)
+                                    switch_task = switch_loop.create_task(self.gen_and_store_rollout(batch_switch, switch_obj_ref,
+                                                                                        extra_info=extra_info))
+                                    switch_loop.run_until_complete(switch_task)
+                                _, sync_running = ray.wait(sync_running, num_returns=len(sync_running), timeout=0.1)
+                            self.stop_event.clear()
+
+                # Log rollout generations if enabled
+                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                if rollout_data_dir:
+                    with _timer("dump_rollout_generations", timing_raw):
+                        print(batch.batch.keys())
+                        inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+                        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                        scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                        self._dump_generations(
+                            inputs=inputs,
+                            outputs=outputs,
+                            scores=scores,
+                            reward_extra_infos_dict=reward_extra_infos_dict,
+                            dump_path=rollout_data_dir,
+                        )
+
+                # validate
+                if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
+                    with _timer("testing", timing_raw):
+                        val_metrics: dict = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                    metrics.update(val_metrics)
+
+                if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                    with _timer("save_checkpoint", timing_raw):
+                        self._save_checkpoint()
+                
                 # training metrics
                 metrics.update(
                     {
@@ -1199,16 +1277,5 @@ class RayPPOTrainer:
                 progress_bar.update(1)
                 self.global_steps += 1
             
-            new_loop.stop()
-            # cancel uncompleted generation tasks
-            print(f"Ray cancel {len(gen_obj_ref_list)} tasks")
-            for index in range(len(gen_obj_ref_list)):
-                finished, still_running = ray.wait(gen_obj_ref_list[index].futures)
-                if len(still_running) > 0:
-                    for obj_ref in still_running:
-                        ray.cancel(obj_ref, recursive=True)
-            
-            batch_list.clear()
-            gen_obj_ref_list.clear()
-            metrics_list.clear()
-            timing_raw_list.clear()
+            # batch_list.clear()
+            # gen_obj_ref_list.clear()

@@ -125,6 +125,7 @@ ENV/
 slurm**
 **.png
 plot**
+dump/**
 
 # data
 data/**.parquet

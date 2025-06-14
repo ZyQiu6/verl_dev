@@ -337,13 +337,10 @@ class LLM(LLM):
 
     def transfer_partial(self) -> None:
         if self.partial_rollout_enable:
-            if self.partial_rollout_mode == "recompute":
-                self.llm_engine.transfer_partial_to_waiting()
-            else: # reuse
-                self.llm_engine.transfer_partial_to_swapped()
+            self.llm_engine.transfer_partial_to_waiting()
 
     def reschedule_partial_requests(self, n_seqs: bool) -> None:
-        if n_seqs and self.partial_rollout_mode == "recompute":  
+        if n_seqs: # and recompute
             # sort seq_groups by request_id
             sorted_partial_seq_groups = self.llm_engine.sorted_partial_seq_groups()
             print(f"sorted_partial_seq_groups length: {len(sorted_partial_seq_groups)}")

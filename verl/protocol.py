@@ -750,12 +750,12 @@ class DataProto:
         )
 
     @staticmethod
-    def separate_by_index(data: List['DataProto'], index1: List, index2: List) -> Tuple['DataProto', 'DataProto']:
+    def separate_by_index(data: "DataProto", index1: List, index2: List) -> Tuple['DataProto', 'DataProto']:
         batch_1 = {}
         batch_2 = {}
         for key, value in data.batch.items():
-            batch_1[key] = torch.index_select(value, dim=0, index=torch.IntTensor(index1))
-            batch_2[key] = torch.index_select(value, dim=0, index=torch.IntTensor(index2))
+            batch_1[key] = torch.index_select(value, dim=0, index=torch.IntTensor(index1).to(value.device))
+            batch_2[key] = torch.index_select(value, dim=0, index=torch.IntTensor(index2).to(value.device))
         non_tensor_batch_1 = {}
         non_tensor_batch_2 = {}
         for key, value in data.non_tensor_batch.items():
@@ -768,6 +768,32 @@ class DataProto:
                                 non_tensor_batch=non_tensor_batch_2,
                                 meta_info=data.meta_info)
         return batch1, batch2
+    
+    @staticmethod
+    def reorder_by_responding_element(data: List['DataProto'], target_dp: "DataProto", element_name: str) -> List['DataProto']:
+        # only for non_tensor_batch
+        if element_name in target_dp.non_tensor_batch:
+            target_array = target_dp.non_tensor_batch[element_name]
+        elif element_name in target_dp.batch:
+            raise ValueError(f"When reorder dataproto, element_name {element_name} is not in non_tensor_batch.")
+        else:
+            raise ValueError(f"When reorder dataproto, element_name {element_name} is not in target_dp.")
+        for dp in data:
+            src_array = dp.non_tensor_batch[element_name]
+            indices = []
+            for i in range(len(target_array)):
+                dst = np.argwhere(src_array==target_array[i])
+                indices.append(dst[0][0])
+            dp.reorder(torch.tensor(indices))
+        
+        return data
+    
+    def delete_element(self, keys: List[str]):
+        for key in keys:
+            if key in self.batch:
+                del self.batch[key]
+            if key in self.non_tensor_batch:
+                del self.non_tensor_batch[key]
 
 @dataclass
 class DataProtoFuture:

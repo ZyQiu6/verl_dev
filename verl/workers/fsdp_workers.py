@@ -739,7 +739,7 @@ class ActorRolloutRefWorker(Worker):
             "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        print(f"{self.rank} starts generation")
+        # print(f"{self.rank} starts generation")
         with self.rollout_sharding_manager:
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
@@ -796,7 +796,7 @@ class ActorRolloutRefWorker(Worker):
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        print("compute_log_prob")
+        # print("compute_log_prob")
 
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
@@ -833,7 +833,7 @@ class ActorRolloutRefWorker(Worker):
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp_fuse)
-        print("compute_log_prob_fused")
+        # print("compute_log_prob_fused")
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
         # we should always recompute old_log_probs when it is HybridEngine
@@ -1024,10 +1024,9 @@ class ActorRolloutRefWorker(Worker):
         elif fsdp_strategy == 'fsdp2':
             from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
             
-            cpu_offload= None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
+            cpu_offload = CPUOffloadPolicy(pin_memory=True)
             fsdp2_load_full_state_dict(self.actor_module_fsdp, model_weights, cpu_offload=cpu_offload)
-        torch.distributed.barrier()
-            
+        
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
@@ -1038,28 +1037,26 @@ class ActorRolloutRefWorker(Worker):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        from torch.distributed._tensor import DTensor
-
-        # model_state_dict = self.actor_module_fsdp.state_dict()
+        model_state_dict = self.actor_module_fsdp.state_dict()
         # begin_time = time.time()
-        # for k, v in model_state_dict.items():
-        #     model_state_dict[k] = v.full_tensor()
-        # for k, v in model_state_dict.items():
-        #     model_state_dict[k] = model_state_dict[k].to("cpu")
+        for k, v in model_state_dict.items():
+            if self.world_size != 1 and hasattr(v, "full_tensor"):
+                v = v.full_tensor()
+            model_state_dict[k] = v.cpu()
         # print(f"to cpu time={time.time()-begin_time}")
 
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
-        begin_time = time.time()
+        # from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        # from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
         
-        with FSDP.state_dict_type(
-            self.actor_module_fsdp,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
-            FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True),
-        ):
-            model_state_dict = self.actor_module_fsdp.state_dict()
-        print(f"state_dict_type time={time.time()-begin_time}")
+        # begin_time = time.time()
+        # with FSDP.state_dict_type(
+        #     self.actor_module_fsdp,
+        #     StateDictType.FULL_STATE_DICT,
+        #     FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+        #     FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True),
+        # ):
+        #     model_state_dict = self.actor_module_fsdp.state_dict()
+        # print(f"state_dict_type time={time.time()-begin_time}")
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
@@ -1332,7 +1329,7 @@ class CriticWorker(Worker):
     def compute_values(self, data: DataProto):
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
-        print("compute_values")
+        # print("compute_values")
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
