@@ -67,7 +67,7 @@ class Scheduler(Scheduler):
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
             sliding_window=self.cache_config.sliding_window,
-            enable_caching=self.cache_config.enable_prefix_caching,
+            enable_caching=False,
         )
 
         # Sequence groups in the WAITING state.
@@ -150,6 +150,7 @@ class Scheduler(Scheduler):
         self.partial_rollout_blocks_to_swap_out: List[Tuple[int, int]] = []
         # For overlapping rollout and inference
         self.fused_request_ids = []
+        self.fuse: Deque[SequenceGroup] = deque()
         
     def clear_rollout_steps(self) -> None:
         self.sequence_group_rollout_steps = {}
@@ -193,25 +194,22 @@ class Scheduler(Scheduler):
             if waiting_group.is_finished():
                 del waiting_groups[i]
                 continue
-            if self.partial_rollout_mode == "recompute":
-                self._free_seq_group_cross_attn_blocks(waiting_group)
-            else: # swap out
-                self._swap_out(waiting_group, self.partial_rollout_blocks_to_swap_out)
+            # recompute
+            self._free_seq_group_cross_attn_blocks(waiting_group)
             # Remove the request.
             for seq in waiting_group.get_seqs():
                 if seq.is_finished():
                     continue
-                if self.partial_rollout_mode == "recompute": # recompute
-                    seq.status = SequenceStatus.WAITING
-                    seq.reset_state_for_recompute()
-                    self.free_seq(seq)
-                else: # swap out
-                    seq.status = SequenceStatus.SWAPPED
+                # recompute
+                seq.status = SequenceStatus.WAITING
+                seq.reset_state_for_recompute()
+                self.free_seq(seq)
         
         self.partial.extend(waiting_groups)
 
     def transfer_partial_to_waiting(self) -> None:
-        self.waiting.extend(self.partial)
+        if len(self.partial) > 0:
+            self.waiting.extend(self.partial)
         self.partial.clear()
         
     def transfer_partial_to_swapped(self) -> None:
@@ -262,15 +260,21 @@ class Scheduler(Scheduler):
             for temp_group in temp_groups:
                 # Remove the sequence group from the state queue.
                 state_queue.remove(temp_group)
-        for i in range(len(waiting_groups)):
+        for i in range(len(waiting_groups)-1, -1, -1):
             waiting_group = waiting_groups[i]
-            if self.partial_rollout_mode == "recompute":
-                self._free_seq_group_cross_attn_blocks(waiting_group)
+            if waiting_group.is_finished():
+                del waiting_groups[i]
+                continue
+            # recompute
+            self._free_seq_group_cross_attn_blocks(waiting_group)
             # Remove the request.
             for seq in waiting_group.get_seqs():
                 if seq.is_finished():
                     continue
+                seq.status = SequenceStatus.WAITING
+                seq.reset_state_for_recompute()
                 self.free_seq(seq)
+        self.fuse.extend(waiting_groups)
                 
     def is_request_fused(self, request_id: str) -> bool:
         return (request_id in self.fused_request_ids)
@@ -284,3 +288,6 @@ class Scheduler(Scheduler):
         res.extend(self.waiting)
         res.extend(self.swapped)
         return res
+
+    def get_and_reset_fuse_buffer(self) -> Deque[SequenceGroup]:
+        return self.fuse

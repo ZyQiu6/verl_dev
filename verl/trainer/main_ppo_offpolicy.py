@@ -21,7 +21,7 @@ import hydra
 import torch
 import ray
 
-from verl.trainer.ppo.ray_trainer_offline import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer_offpolicy import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 
 
@@ -120,7 +120,7 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        from verl.trainer.ppo.ray_trainer_offline import ResourcePoolManager, Role
+        from verl.trainer.ppo.ray_trainer_offpolicy import ResourcePoolManager, Role
 
         role_worker_mapping = {
             Role.Rollout: ray.remote(ActorRolloutRefWorker),
@@ -133,7 +133,6 @@ class TaskRunner:
         rollout_pool_id = 'rollout_pool'
         ref_pool_id = 'ref_pool'
         critic_pool_id = 'critic_pool'
-        assert config.trainer.n_gpus_per_node % 4 == 0, "n_gpus must be divisible by 4."
         resource_pool_spec = {
             actor_pool_id: [config.trainer.n_gpus_per_node // 2] * config.trainer.nnodes,
             rollout_pool_id: [config.trainer.n_gpus_per_node // 2] * config.trainer.nnodes,

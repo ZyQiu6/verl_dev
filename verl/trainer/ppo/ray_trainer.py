@@ -959,6 +959,7 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
+                    gen_batch.non_tensor_batch['uid'] = deepcopy(batch.non_tensor_batch['uid'])
                     # generate a batch
                     with _timer("gen", timing_raw):
                         if not self.async_rollout_mode:
@@ -993,6 +994,7 @@ class RayPPOTrainer:
                         if len(replay_buffer) > 0:
                             batch = DataProto.concat([replay_buffer, batch])
                             replay_buffer = DataProto()
+                        batch = DataProto.reorder_by_responding_element([batch], gen_batch_output, "uid")[0]
                         selected_replay_index = []
                         finished_index = []
                         for index, finished in enumerate(output_finished.tolist()):
@@ -1001,6 +1003,7 @@ class RayPPOTrainer:
                             else:
                                 selected_replay_index.append(index)
                         batch, replay_buffer = DataProto.separate_by_index(batch, finished_index, selected_replay_index)
+                        _ = gen_batch_output.non_tensor_batch.pop("uid") # pop uid to avoid other bugs
                         gen_batch_output, gen_replay_buffer = DataProto.separate_by_index(gen_batch_output, finished_index, selected_replay_index)
 
                     batch = batch.union(gen_batch_output)
@@ -1027,107 +1030,110 @@ class RayPPOTrainer:
                                 batch = DataProto.concat([batch, finished_batch]) 
 
                             output_fused = gen_replay_buffer.non_tensor_batch.pop("output_fused")
-                            replay_index = []
-                            fused_index = []
-                            for index, fused in enumerate(output_fused.tolist()):
-                                if fused:
-                                    fused_index.append(index)
-                                else:
-                                    replay_index.append(index)
-                            fuse_buffer, replay_buffer = DataProto.separate_by_index(replay_buffer, fused_index, replay_index)
-                            gen_fuse_buffer, _ = DataProto.separate_by_index(gen_replay_buffer, fused_index, replay_index)
-                            _ = gen_fuse_buffer.non_tensor_batch.pop("seq_finished") # pop this element in batch to avoid concat bugs
-                            fuse_buffer = fuse_buffer.union(gen_fuse_buffer)
-
-                            gen_fused_ref = self.actor_rollout_wg.generate_sequences_fused(prompts=fuse_buffer, ranks=self.rollout_ranks)
-                            
-                            batch, pad_size = pad_dataproto_to_divisor(batch, len(self.inference_ranks))
-                            batch.batch["response_mask"] = compute_response_mask(batch)
-                            
-                            with _timer("reward_overlap", timing_raw):
-                                # compute reward model score
-                                if self.use_rm:
-                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
-                                    batch = batch.union(reward_tensor)
-
-                                if self.config.reward_model.launch_reward_fn_async:
-                                    future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
-                                else:
-                                    reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-                                    
-                                # we combine with rule-based rm
-                                reward_extra_infos_dict: dict[str, list]
-                                if self.config.reward_model.launch_reward_fn_async:
-                                    reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                                batch.batch["token_level_scores"] = reward_tensor
-
-                                print(f"{list(reward_extra_infos_dict.keys())=}")
-                                if reward_extra_infos_dict:
-                                    batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-                                    
-                            # recompute old_log_probs
-                            with _timer("old_log_prob_overlap", timing_raw):
-                                old_log_prob = self.actor_rollout_wg.compute_log_prob_fused(batch, ranks=self.critic_inference_ranks)
-                                entropys = old_log_prob.batch["entropys"]
-                                response_masks = batch.batch["response_mask"]
-                                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                                entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                                old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
-                                metrics.update(old_log_prob_metrics)
-                                old_log_prob.batch.pop("entropys")
-                                batch = batch.union(old_log_prob)
-                            
-                            if self.use_critic:
-                                # compute values
-                                with _timer("values_overlap", timing_raw):
-                                    values = self.critic_wg.compute_values_fused(batch, ranks=self.critic_inference_ranks)
-                                    batch = batch.union(values)
-                            
-                            if self.use_reference_policy:
-                                # compute reference log_prob
-                                with _timer("ref_overlap", timing_raw):
-                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob_fused(batch, ranks=self.actor_inference_ranks)
-                                    batch = batch.union(ref_log_prob)
-                            
-                            # TODO: check if n != 1, the group have unfinished responses
-                            seq_finished = gen_replay_buffer.non_tensor_batch.pop("seq_finished")
-                            if self.config.actor_rollout_ref.rollout.n > 1:
-                                uid_finished_dict = {}
-                                # update uid_finished_dict
-                                for i in range(len(fused_batch)):
-                                    uid = fused_batch.non_tensor_batch['uid'][i]
-                                    if uid in uid_finished_dict:
-                                        continue
-                                    uid_finished_dict[uid] = True
-                                    for j in range(len(replay_buffer)):
-                                        if (replay_buffer.non_tensor_batch['uid'][j] == uid) and not seq_finished[j]:
-                                            uid_finished_dict[uid] = False
-                                            break
-                                fuse_finished_index = []
-                                fuse_unfinished_index = []
-                                replay_finished_index = []
-                                replay_unfinished_index = []
-                                for i in range(len(fused_batch)):
-                                    uid = fused_batch.non_tensor_batch['uid'][i]
-                                    if uid_finished_dict[uid]:
-                                        fuse_finished_index.append(i)
+                            if any(output_fused):
+                                replay_index = []
+                                fused_index = []
+                                for index, fused in enumerate(output_fused.tolist()):
+                                    if fused:
+                                        fused_index.append(index)
                                     else:
-                                        fuse_unfinished_index.append(i)
-                                for i in range(len(replay_buffer)):
-                                    uid = fused_batch.non_tensor_batch['uid'][i]
-                                    if (uid in uid_finished_dict) and uid_finished_dict[uid]:
-                                        replay_finished_index.append(i)
+                                        replay_index.append(index)
+                                fuse_buffer, replay_buffer = DataProto.separate_by_index(replay_buffer, fused_index, replay_index)
+                                gen_fuse_buffer, _ = DataProto.separate_by_index(gen_replay_buffer, fused_index, replay_index)
+                                _ = gen_fuse_buffer.non_tensor_batch.pop("seq_finished") # pop this element in batch to avoid concat bugs
+                                fuse_buffer = fuse_buffer.union(gen_fuse_buffer)
+
+                                gen_fused_ref = self.actor_rollout_wg.generate_sequences_fused(prompts=fuse_buffer, ranks=self.rollout_ranks)
+                                
+                                batch, pad_size = pad_dataproto_to_divisor(batch, len(self.inference_ranks))
+                                batch.batch["response_mask"] = compute_response_mask(batch)
+                                
+                                with _timer("reward_overlap", timing_raw):
+                                    # compute reward model score
+                                    if self.use_rm:
+                                        reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                        batch = batch.union(reward_tensor)
+
+                                    if self.config.reward_model.launch_reward_fn_async:
+                                        future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                                     else:
-                                        replay_unfinished_index.append(i)
-                                fuse_finished, fuse_unfinished = DataProto.separate_by_index(fused_batch, fuse_finished_index, fuse_unfinished_index)
-                                fuse_replay_buffer = DataProto.concat([fuse_replay_buffer, fuse_unfinished])
-                                # set replay buffer
-                                replay_finished, replay_buffer = DataProto.separate_by_index(replay_buffer, replay_finished_index, replay_unfinished_index)
-                                gen_replay_finished, gen_replay_unfinished = DataProto.separate_by_index(gen_replay_buffer, replay_finished_index, replay_unfinished_index)
-                                fused_batch = DataProto.concat([fuse_finished, replay_finished.union(gen_replay_finished)]) 
-                            
-                            overlapped_batch = unpad_dataproto(batch, pad_size=pad_size)
-                            batch = ray.get(gen_fused_ref)
+                                        reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                                        
+                                    # we combine with rule-based rm
+                                    reward_extra_infos_dict: dict[str, list]
+                                    if self.config.reward_model.launch_reward_fn_async:
+                                        reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                                    batch.batch["token_level_scores"] = reward_tensor
+
+                                    print(f"{list(reward_extra_infos_dict.keys())=}")
+                                    if reward_extra_infos_dict:
+                                        batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                                        
+                                # recompute old_log_probs
+                                if self.config.trainer.fuse_old_log_prob:
+                                    with _timer("old_log_prob_overlap", timing_raw):
+                                        old_log_prob = self.actor_rollout_wg.compute_log_prob_fused(batch, ranks=self.critic_inference_ranks)
+                                        entropys = old_log_prob.batch["entropys"]
+                                        response_masks = batch.batch["response_mask"]
+                                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                                        entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                                        old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                                        metrics.update(old_log_prob_metrics)
+                                        old_log_prob.batch.pop("entropys")
+                                        batch = batch.union(old_log_prob)
+                                
+                                if self.config.trainer.fuse_value:
+                                    if self.use_critic:
+                                        # compute values
+                                        with _timer("values_overlap", timing_raw):
+                                            values = self.critic_wg.compute_values_fused(batch, ranks=self.critic_inference_ranks)
+                                            batch = batch.union(values)
+                                
+                                if self.use_reference_policy:
+                                    # compute reference log_prob
+                                    with _timer("ref_overlap", timing_raw):
+                                        ref_log_prob = self.ref_policy_wg.compute_ref_log_prob_fused(batch, ranks=self.actor_inference_ranks)
+                                        batch = batch.union(ref_log_prob)
+                                
+                                # TODO: check if n != 1, the group have unfinished responses
+                                seq_finished = gen_replay_buffer.non_tensor_batch.pop("seq_finished")
+                                if self.config.actor_rollout_ref.rollout.n > 1:
+                                    uid_finished_dict = {}
+                                    # update uid_finished_dict
+                                    for i in range(len(fused_batch)):
+                                        uid = fused_batch.non_tensor_batch['uid'][i]
+                                        if uid in uid_finished_dict:
+                                            continue
+                                        uid_finished_dict[uid] = True
+                                        for j in range(len(replay_buffer)):
+                                            if (replay_buffer.non_tensor_batch['uid'][j] == uid) and not seq_finished[j]:
+                                                uid_finished_dict[uid] = False
+                                                break
+                                    fuse_finished_index = []
+                                    fuse_unfinished_index = []
+                                    replay_finished_index = []
+                                    replay_unfinished_index = []
+                                    for i in range(len(fused_batch)):
+                                        uid = fused_batch.non_tensor_batch['uid'][i]
+                                        if uid_finished_dict[uid]:
+                                            fuse_finished_index.append(i)
+                                        else:
+                                            fuse_unfinished_index.append(i)
+                                    for i in range(len(replay_buffer)):
+                                        uid = fused_batch.non_tensor_batch['uid'][i]
+                                        if (uid in uid_finished_dict) and uid_finished_dict[uid]:
+                                            replay_finished_index.append(i)
+                                        else:
+                                            replay_unfinished_index.append(i)
+                                    fuse_finished, fuse_unfinished = DataProto.separate_by_index(fused_batch, fuse_finished_index, fuse_unfinished_index)
+                                    fuse_replay_buffer = DataProto.concat([fuse_replay_buffer, fuse_unfinished])
+                                    # set replay buffer
+                                    replay_finished, replay_buffer = DataProto.separate_by_index(replay_buffer, replay_finished_index, replay_unfinished_index)
+                                    gen_replay_finished, gen_replay_unfinished = DataProto.separate_by_index(gen_replay_buffer, replay_finished_index, replay_unfinished_index)
+                                    fused_batch = DataProto.concat([fuse_finished, replay_finished.union(gen_replay_finished)]) 
+                                
+                                overlapped_batch = unpad_dataproto(batch, pad_size=pad_size)
+                                batch = ray.get(gen_fused_ref)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # pad batch
@@ -1151,10 +1157,11 @@ class RayPPOTrainer:
                             batch = batch.union(ref_log_prob)
 
                     # compute values
-                    if self.use_critic:
-                        with _timer("values", timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                    if self.config.trainer.fuse_value:
+                        if self.use_critic:
+                            with _timer("values", timing_raw):
+                                values = self.critic_wg.compute_values(batch)
+                                batch = batch.union(values)
                         
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1170,21 +1177,44 @@ class RayPPOTrainer:
                         batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                     # recompute old_log_probs
-                    with _timer("old_log_prob", timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                    if self.config.trainer.fuse_old_log_prob:
+                        with _timer("old_log_prob", timing_raw):
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                            old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                            batch = batch.union(old_log_prob)
                         
                     batch = unpad_dataproto(batch, pad_size=pad_size)
                     if fuse_enable:
                         batch = DataProto.concat([batch, overlapped_batch])
 
+                    # pad batch
+                    batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
+                    # compute values, no overlap
+                    if not self.config.trainer.fuse_value:
+                        if self.use_critic:
+                            with _timer("values", timing_raw):
+                                values = self.critic_wg.compute_values(batch)
+                                batch = batch.union(values)
+                    
+                    # recompute old_log_probs, no overlap
+                    if not self.config.trainer.fuse_old_log_prob:
+                        with _timer("old_log_prob", timing_raw):
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                            old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                            batch = batch.union(old_log_prob)
+                    
                     with _timer("adv", timing_raw):
                         batch.meta_info.update({'fuse_enable': fuse_enable,})
                             
@@ -1235,8 +1265,8 @@ class RayPPOTrainer:
                                 self.actor_rollout_wg.sync_fuse_actor_model_weights()
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-                        
-                    # can't directly obtain self.actor_rollout_wg.config
+
+                    batch = unpad_dataproto(batch, pad_size=pad_size)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -1254,17 +1284,17 @@ class RayPPOTrainer:
                                 dump_path=rollout_data_dir,
                             )
 
-                    # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
-                        with _timer("testing", timing_raw):
-                            val_metrics: dict = self._validate()
-                            if is_last_step:
-                                last_val_metrics = val_metrics
-                        metrics.update(val_metrics)
+                # validate
+                if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
+                    with _timer("testing", timing_raw):
+                        val_metrics: dict = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                    metrics.update(val_metrics)
 
-                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                        with _timer("save_checkpoint", timing_raw):
-                            self._save_checkpoint()
+                if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                    with _timer("save_checkpoint", timing_raw):
+                        self._save_checkpoint()
 
                 # training metrics
                 metrics.update(

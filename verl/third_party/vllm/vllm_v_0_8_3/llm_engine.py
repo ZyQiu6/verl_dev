@@ -318,7 +318,7 @@ class LLMEngine(LLMEngine):
         engine_args: EngineArgs,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
-        partial_rollout_save_steps: Optional[int] = None,
+        # partial_rollout_save_steps: Optional[int] = None,
     ) -> "LLMEngine":
         """Creates an LLM engine from the engine arguments."""
         # Create the engine configs.
@@ -338,6 +338,9 @@ class LLMEngine(LLMEngine):
             disable_log_stats=engine_args.disable_log_stats,
             # partial_rollout_save_steps=partial_rollout_save_steps,
         )
+
+    def set_partial_rollout_save_steps(self, partial_rollout_save_steps: int) -> None:
+        self.partial_rollout_save_steps = partial_rollout_save_steps
 
     def set_partial_rollout_enable(self, partial_rollout_enable: bool, virtual_engine=0) -> None:
         self.partial_rollout_enable = partial_rollout_enable
@@ -426,11 +429,6 @@ class LLMEngine(LLMEngine):
             (seq_group_metadata_list, scheduler_outputs,
              allow_async_output_proc
              ) = self.scheduler[virtual_engine].schedule()
-            
-            if self.partial_rollout_enable and self.partial_rollout_mode == "reuse":
-                scheduler_outputs.blocks_to_swap_out.extend(
-                    self.scheduler[virtual_engine].get_and_reset_partial_rollout_blocks_to_swap_out()
-                )
             
             ctx.seq_group_metadata_list = seq_group_metadata_list
             ctx.scheduler_outputs = scheduler_outputs
@@ -544,7 +542,7 @@ class LLMEngine(LLMEngine):
         for seq_group_metadata in seq_group_metadata_list:
             request_id = seq_group_metadata.request_id
             self.scheduler[virtual_engine].add_rollout_steps(request_id)
-        
+
         if self.partial_rollout_enable:
             for seq_group_metadata in seq_group_metadata_list:
                 request_id = seq_group_metadata.request_id
@@ -573,9 +571,9 @@ class LLMEngine(LLMEngine):
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
         
-        if self.partial_rollout_enable:
-            assert len(ctx.request_outputs) == len(seq_group_metadata_list), \
-            f"len(ctx.request_outputs): {len(ctx.request_outputs)},len(seq_group_metadata_list): {len(seq_group_metadata_list)}"
+        # if self.partial_rollout_enable:
+        #     assert len(ctx.request_outputs) == len(seq_group_metadata_list), \
+        #     f"len(ctx.request_outputs): {len(ctx.request_outputs)},len(seq_group_metadata_list): {len(seq_group_metadata_list)}"
 
         return ctx.request_outputs
 

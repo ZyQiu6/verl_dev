@@ -205,6 +205,9 @@ class vLLMRollout(BaseRollout):
         # Partial rollout
         self.replay_buffer = DataProto()
         self.inference_engine.set_max_response_len(config.response_length)
+        
+        # Combine fuse and partial rollout
+        self.fuse_replay_buffer = DataProto()
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -231,6 +234,8 @@ class vLLMRollout(BaseRollout):
             partial_rollout_enable = prompts.meta_info['partial_rollout_enable']
         if 'fuse_enable' in prompts.meta_info:
             fuse_enable = prompts.meta_info['fuse_enable']
+        if partial_rollout_enable or fuse_enable:
+            uids = prompts.non_tensor_batch.pop('uid')
 
         # rebuild vllm cache engine
         if (
@@ -240,7 +245,6 @@ class vLLMRollout(BaseRollout):
                 "0.6.3",
             )
             and self.config.free_cache_engine
-            and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse')
         ):
             self.inference_engine.init_cache_engine()
 
@@ -283,6 +287,7 @@ class vLLMRollout(BaseRollout):
         with self.update_sampling_params(**kwargs):
             self.inference_engine.set_partial_rollout_enable(partial_rollout_enable)
             self.inference_engine.set_fuse_enable(fuse_enable)
+            self.inference_engine.transfer_partial()
             output = self.inference_engine.generate(
                 prompts=None,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
@@ -314,11 +319,13 @@ class vLLMRollout(BaseRollout):
         # Partial rollout add requests
         last_batch_size = 0
         if partial_rollout_enable and len(self.replay_buffer) > 0:
+            uids = np.concatenate((self.replay_buffer.non_tensor_batch['uid'], uids), axis=0)
             idx = torch.cat((self.replay_buffer.batch['input_ids'], idx), dim=0)
             attention_mask = torch.cat((self.replay_buffer.batch['attention_mask'], attention_mask), dim=0)
             position_ids = torch.cat((self.replay_buffer.batch['position_ids'], position_ids), dim=0)
             last_batch_size = len(self.replay_buffer)
             batch_size = last_batch_size + batch_size
+            self.replay_buffer = DataProto()
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
@@ -341,7 +348,10 @@ class vLLMRollout(BaseRollout):
             batch_replay["input_ids"] = torch.index_select(idx, dim=0, index=torch.IntTensor(selected_replay_index).to(idx.device)).to(idx.device)
             batch_replay["attention_mask"] = torch.index_select(attention_mask, dim=0, index=torch.IntTensor(selected_replay_index).to(idx.device)).to(idx.device)
             batch_replay["position_ids"] = torch.index_select(position_ids, dim=0, index=torch.IntTensor(selected_replay_index).to(idx.device)).to(idx.device)
-            self.replay_buffer = DataProto(batch=TensorDict(batch_replay, batch_size=len(selected_replay_index)))
+            non_batch_replay = {}
+            non_batch_replay["uid"] = uids[selected_replay_index]
+            self.replay_buffer = DataProto(batch=TensorDict(batch_replay, batch_size=len(selected_replay_index)),
+                                           non_tensor_batch=non_batch_replay)
 
         # TODO(sgm): fix position_ids on right_pad
         # prompt: left pad + response: right pad
@@ -349,7 +359,8 @@ class vLLMRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        # response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        response_attention_mask = self.get_response_mask_by_pad_id(response)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
         
         batch_dict = {
@@ -358,15 +369,8 @@ class vLLMRollout(BaseRollout):
                 'input_ids': seq,  # here input_ids become the whole sentences
                 # 'old_log_probs': log_probs, # we will recompute old log prob with actor
                 'attention_mask': attention_mask,
-                'position_ids': position_ids
+                'position_ids': position_ids,
             }
-        # if partial_rollout_enable:
-        #     batch_size = len(finished_index)
-        #     batch_dict["prompts"] = torch.index_select(idx, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
-        #     batch_dict["responses"] = torch.index_select(response, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
-        #     batch_dict["input_ids"] = torch.index_select(seq, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
-        #     batch_dict["attention_mask"] = torch.index_select(attention_mask, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
-        #     batch_dict["position_ids"] = torch.index_select(position_ids, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
         batch = TensorDict(
@@ -381,7 +385,6 @@ class vLLMRollout(BaseRollout):
                 "0.6.3",
             )
             and self.config.free_cache_engine
-            and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse')
         ):
             self.inference_engine.free_cache_engine()
 
@@ -389,9 +392,7 @@ class vLLMRollout(BaseRollout):
 
         if partial_rollout_enable or fuse_enable:
             np_batch.update({"output_finished": np.array(output_finished, dtype=object)})
-            # output_proto.meta_info = {
-            #     "output_finished": output_finished,
-            # }
+            np_batch.update({"uid": np.array(uids, dtype=object)})
         if fuse_enable:
             np_batch.update({"output_fused": np.array(output_fused, dtype=object)})
             np_batch.update({"seq_finished": np.array(seq_finished, dtype=object)})
@@ -413,6 +414,29 @@ class vLLMRollout(BaseRollout):
                     setattr(params, key, value)
         return params
 
+    def rollout_finished(self, item) -> bool:
+        # item should be DataProtoItem, mainly for generate_sequences_fused
+        response = item.batch['responses']
+
+        # 1. check if eos_token exists
+        eos_token_id = item.meta_info['eos_token_id']
+        eos_mask = torch.isin(response, torch.tensor(eos_token_id, device=response.device)).int()
+        if eos_mask.sum().item() > 0:
+            return True
+        
+        # 2. check if length reaches max_length
+        response_mask = self.get_response_mask_by_pad_id(response)
+        response_length = response_mask.sum().float().item()
+        if response_length >= self.config.response_length:
+            return True
+        
+        return False
+    
+    def get_response_mask_by_pad_id(self, response_id: torch.Tensor, dtype=torch.int64):
+        response_mask = torch.isin(response_id, torch.tensor(self.pad_token_id, device=response_id.device)).int()
+        response_mask = response_mask.eq(0).to(dtype)
+        return response_mask
+
     @torch.no_grad()
     def generate_sequences_fused(self, prompts: DataProto, **kwargs) -> DataProto:
         # rebuild vllm cache engine
@@ -424,6 +448,10 @@ class vLLMRollout(BaseRollout):
             )
         ):
             self.inference_engine.init_cache_engine()
+            
+        if len(self.fuse_replay_buffer) > 0:
+            prompts = DataProto.concat([self.fuse_replay_buffer, prompts])
+            self.fuse_replay_buffer = DataProto()
         
         idx = prompts.batch.pop('prompts')  # (bs, prompt_length)
         # left-padded attention_mask
@@ -459,10 +487,12 @@ class vLLMRollout(BaseRollout):
 
         self.inference_engine.set_partial_rollout_enable(partial_rollout_enable)
         self.inference_engine.set_fuse_enable(fuse_enable)
+        gen_length_max = self.config.partial_rollout_save_steps if self.config.partial_rollout_save_steps else self.config.response_length
         output = self.inference_engine.generate(
             prompts=None,  # because we have already convert it to prompt token id
             sampling_params=[self.get_updated_sampling_params_fused(
-                max_tokens=self.sampling_params.max_tokens-1-int(old_response_length[i].item()),
+                max_tokens=min(self.config.response_length-int(old_response_length[i].item()),
+                               gen_length_max),
                 n=1,
                 ) for i in range(batch_size)],
             prompt_token_ids=idx_list,
@@ -474,13 +504,14 @@ class vLLMRollout(BaseRollout):
         output_finished = output[2]
         output_fused = output[3]
         
-        # concat old responses and new response
-        new_response_attention_mask = get_response_mask(response_id=new_response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        new_response_attention_mask = self.get_response_mask_by_pad_id(new_response)
+        # new_response_attention_mask = get_response_mask(response_id=new_response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         new_response_length = new_response_attention_mask.sum(-1).float()  # (batch_size,)
         
         new_response = new_response.tolist()
         response = []
         for i in range(batch_size):
+            # concat old responses and new response
             response.append(
                 torch.cat([torch.Tensor(old_responses[i]), torch.Tensor(new_response[i][:int(new_response_length[i].item())])], dim=0))
             
@@ -501,7 +532,8 @@ class vLLMRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        # response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        response_attention_mask = self.get_response_mask_by_pad_id(response)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
         
         batch_dict = {
@@ -529,5 +561,14 @@ class vLLMRollout(BaseRollout):
         
         output_proto = DataProto(batch=batch)
         output_proto = output_proto.union(prompts)
+        
+        finished_index = []
+        unfinished_index = []
+        for i in range(len(output_proto)):
+            if self.rollout_finished(output_proto[i]):
+                finished_index.append(i)
+            else:
+                unfinished_index.append(i)
+        output_proto, self.fuse_replay_buffer = DataProto.separate_by_index(output_proto, finished_index, unfinished_index)
         
         return output_proto

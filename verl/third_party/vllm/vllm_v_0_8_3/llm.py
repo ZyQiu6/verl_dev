@@ -182,7 +182,8 @@ class LLM(LLM):
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, 
             usage_context=UsageContext.LLM_CLASS,
-            partial_rollout_save_steps=partial_rollout_save_steps,)
+            # partial_rollout_save_steps=partial_rollout_save_steps,
+            )
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()
@@ -191,6 +192,7 @@ class LLM(LLM):
         # Partial rollout
         self.partial_rollout_save_steps = partial_rollout_save_steps
         if partial_rollout_save_steps:
+            self.llm_engine.set_partial_rollout_save_steps(partial_rollout_save_steps)
             if not partial_rollout_mode in ["recompute"]:
                 raise ValueError(
                     f"Unexpected partial_rollout_mode value: {partial_rollout_mode}. Must be"
@@ -228,12 +230,12 @@ class LLM(LLM):
         
         request_output_buffer: Dict = {}
         
-        is_first_step = True
+        # is_first_step = True
         while self.llm_engine.has_unfinished_requests():
             # after a step, we transfer partial
-            if is_first_step:
-                self.transfer_partial()
-                is_first_step = False
+            # if is_first_step:
+            #     self.transfer_partial()
+            #     is_first_step = False
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
                 request_output_buffer[output.request_id] = output
@@ -310,7 +312,7 @@ class LLM(LLM):
                     logprobs.append(torch.tensor(v[1]))
                 seq_finished.extend([v[2] for v in val])
                 finished = all([v[2] for v in val])
-                output_fused.extend([self.llm_engine.is_request_fused(v[3]) for v in val]) 
+                output_fused.extend([self.llm_engine.is_request_fused(v[3]) for v in val])
                 output_finished.extend([finished for _ in val])
                 if finished:
                     del self.partial_rollout_id_response_mapping[key]
@@ -356,13 +358,10 @@ class LLM(LLM):
 
     def transfer_partial(self) -> None:
         if self.partial_rollout_enable:
-            if self.partial_rollout_mode == "recompute":
-                self.llm_engine.transfer_partial_to_waiting()
-            else: # reuse
-                self.llm_engine.transfer_partial_to_swapped()
+            self.llm_engine.transfer_partial_to_waiting()
 
     def reschedule_partial_requests(self, n_seqs: bool) -> None:
-        if n_seqs and self.partial_rollout_mode == "recompute":  
+        if n_seqs:  
             # sort seq_groups by request_id
             sorted_partial_seq_groups = self.llm_engine.sorted_partial_seq_groups()
             print(f"sorted_partial_seq_groups length: {len(sorted_partial_seq_groups)}")
