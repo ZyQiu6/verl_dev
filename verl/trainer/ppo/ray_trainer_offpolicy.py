@@ -904,6 +904,16 @@ class RayPPOTrainer:
         # compute global_valid tokens
         batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
         
+        # pad batch
+        batch, pad_size = pad_dataproto_to_divisor(batch, self.rollout_wg.world_size)
+        # recompute old_log_probs
+        old_log_prob = self.rollout_wg.compute_log_prob(batch)
+        entropys = old_log_prob.batch["entropys"]
+        old_log_prob.batch.pop("entropys")
+        batch = batch.union(old_log_prob)
+        # unpad batch
+        batch = unpad_dataproto(batch, pad_size=pad_size)
+        
         info = {}
         if "version" in extra_info:
             version = extra_info["version"]
@@ -939,16 +949,16 @@ class RayPPOTrainer:
                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
         
         # recompute old_log_probs
-        with _timer("old_log_prob", timing_raw):
-            old_log_prob = self.actor_wg.compute_log_prob(batch)
-            entropys = old_log_prob.batch["entropys"]
-            response_masks = batch.batch["response_mask"]
-            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-            entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-            old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
-            metrics.update(old_log_prob_metrics)
-            old_log_prob.batch.pop("entropys")
-            batch = batch.union(old_log_prob)
+        # with _timer("old_log_prob", timing_raw):
+        #     old_log_prob = self.actor_wg.compute_log_prob(batch)
+        #     entropys = old_log_prob.batch["entropys"]
+        #     response_masks = batch.batch["response_mask"]
+        #     loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+        #     entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+        #     old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+        #     metrics.update(old_log_prob_metrics)
+        #     old_log_prob.batch.pop("entropys")
+        #     batch = batch.union(old_log_prob)
 
         if self.use_reference_policy:
             # compute reference log_prob
@@ -1016,7 +1026,7 @@ class RayPPOTrainer:
         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
         if rollout_data_dir:
             with _timer("dump_rollout_generations", timing_raw):
-                print(batch.batch.keys())
+                # print(batch.batch.keys())
                 inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                 outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                 scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
@@ -1141,7 +1151,10 @@ class RayPPOTrainer:
         self.training_datas = [batch_dict for batch_dict in self.train_dataloader]
         
         while True:
-            k = self.config.trainer.offpolicy_sync_freq
+            if self.global_steps < 10:
+                k = 1
+            else:
+                k = self.config.trainer.offpolicy_sync_freq
 
             # while cnt < range_max:
             #     for index, batch_dict in enumerate(self.train_dataloader):
@@ -1222,22 +1235,6 @@ class RayPPOTrainer:
                                     switch_loop.run_until_complete(switch_task)
                                 _, sync_running = ray.wait(sync_running, num_returns=len(sync_running), timeout=0.1)
                             self.stop_event.clear()
-
-                # Log rollout generations if enabled
-                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                if rollout_data_dir:
-                    with _timer("dump_rollout_generations", timing_raw):
-                        print(batch.batch.keys())
-                        inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                        scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                        self._dump_generations(
-                            inputs=inputs,
-                            outputs=outputs,
-                            scores=scores,
-                            reward_extra_infos_dict=reward_extra_infos_dict,
-                            dump_path=rollout_data_dir,
-                        )
 
                 # validate
                 if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
