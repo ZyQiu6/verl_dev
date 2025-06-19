@@ -48,7 +48,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.rollout.partial_rollout_save_steps=450 \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
     critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
@@ -58,14 +57,16 @@ python3 -m verl.trainer.main_ppo \
     critic.model.fsdp_config.optimizer_offload=True \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console'] \
     trainer.project_name='verl_gsm8k_0.5B_256' \
     trainer.experiment_name='fuses+token-level offpolicy' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
+    +trainer.rollout_data_dir=/shared_ssd_storage/ziyiqiu/programs/verl_dev/dump/ \
+    +trainer.rollout_length_dir=/shared_ssd_storage/ziyiqiu/programs/verl_dev/dump/ \
     trainer.save_freq=1000 \
     trainer.test_freq=5 \
-    trainer.fuse_enable=True \
+    trainer.fuse_enable=False \
     trainer.fuse_value=True \
     trainer.fuse_old_log_prob=True \
     trainer.total_epochs=15 $@ >> output.txt

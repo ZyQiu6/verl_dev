@@ -107,7 +107,6 @@ class ActorRolloutRefWorker(Worker):
         import ray
 
         if not torch.distributed.is_initialized():
-            global_rank = torch.cuda.current_device()
             # print(f"init_process_group count={torch.cuda.device_count()} ray={ray.get_gpu_ids()}, self.rank={self.rank}")
             torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
 
@@ -739,7 +738,7 @@ class ActorRolloutRefWorker(Worker):
             "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        # print(f"{self.rank} starts generation")
+        print(f"{self.rank} starts generation")
         with self.rollout_sharding_manager:
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 

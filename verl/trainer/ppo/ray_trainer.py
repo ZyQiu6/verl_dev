@@ -36,6 +36,7 @@ from tensordict import TensorDict
 import numpy as np
 import ray
 import torch
+import matplotlib.pyplot as plt
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
@@ -871,6 +872,21 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _plot_length(self, response_mask, dump_path):
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.png")
+        
+        response_length = response_mask.sum(dim=-1).numpy()
+        response_length_weight = np.zeros_like(response_length) + 1 / len(response_length)
+        plt.hist(response_length, bins=25, color='skyblue', weights=response_length_weight)
+        plt.title('Length distribution of rollout')
+        plt.xlabel('Length')
+        plt.ylabel('Frequency')
+        plt.savefig(filename)
+        plt.close()
+
+        print(f"Ploted length to {filename}")
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1268,21 +1284,31 @@ class RayPPOTrainer:
 
                     batch = unpad_dataproto(batch, pad_size=pad_size)
 
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        with _timer("dump_rollout_generations", timing_raw):
-                            print(batch.batch.keys())
-                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                            self._dump_generations(
-                                inputs=inputs,
-                                outputs=outputs,
-                                scores=scores,
-                                reward_extra_infos_dict=reward_extra_infos_dict,
-                                dump_path=rollout_data_dir,
-                            )
+                # Log rollout generations if enabled
+                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                if rollout_data_dir:
+                    with _timer("dump_rollout_generations", timing_raw):
+                        print(batch.batch.keys())
+                        inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+                        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                        scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                        self._dump_generations(
+                            inputs=inputs,
+                            outputs=outputs,
+                            scores=scores,
+                            reward_extra_infos_dict=reward_extra_infos_dict,
+                            dump_path=rollout_data_dir,
+                        )
+                        
+                # Log response length
+                rollout_length_dir = self.config.trainer.get("rollout_length_dir", None)
+                if rollout_length_dir:
+                    with _timer("dump_rollout_length", timing_raw):
+                        response_masks = batch.batch["response_mask"]
+                        self._plot_length(
+                            response_mask=response_masks,
+                            dump_path=rollout_length_dir,
+                        )
 
                 # validate
                 if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):

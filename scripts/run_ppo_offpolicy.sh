@@ -64,7 +64,7 @@ python3 -m verl.trainer.main_ppo_offpolicy \
     trainer.experiment_name='sequence-level offpolicy switch+token-level offpolicy' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    +trainer.rollout_data_dir=/shared_ssd_storage/ziyiqiu/programs/verl_dev/ \
+    +trainer.rollout_data_dir=/shared_ssd_storage/ziyiqiu/programs/verl_dev/dump/ \
     trainer.save_freq=1000 \
     trainer.test_freq=5 \
     trainer.total_epochs=15 $@ >> output.txt
