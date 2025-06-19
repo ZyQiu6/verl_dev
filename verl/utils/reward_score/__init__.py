@@ -56,6 +56,10 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
         from . import geo3k
 
         res = geo3k.compute_score(solution_str, ground_truth)
+    elif data_source.startswith("sky_t1_math"):
+        from . import sky_t1_aime
+        
+        res = sky_t1_aime.compute_score(solution_str, ground_truth)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
