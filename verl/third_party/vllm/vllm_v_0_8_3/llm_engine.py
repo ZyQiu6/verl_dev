@@ -326,8 +326,7 @@ class LLMEngine(LLMEngine):
 
         engine_cls = cls
         if envs.VLLM_USE_V1:
-            from vllm.v1.engine.llm_engine import LLMEngine as V1LLMEngine
-            raise ValueError('Now we do not support V1 Engine.')
+            from .v1_llm_engine import LLMEngine as V1LLMEngine
             engine_cls = V1LLMEngine
 
         print("create vllm llm engine")

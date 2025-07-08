@@ -1338,6 +1338,7 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                print(f"metrics: {metrics}")
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
