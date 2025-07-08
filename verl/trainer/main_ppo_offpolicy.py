@@ -141,7 +141,7 @@ class TaskRunner:
         mapping = {
             Role.Actor: actor_pool_id,
             Role.Rollout: rollout_pool_id,
-            Role.Critic: actor_pool_id,
+            Role.Critic: rollout_pool_id,
         }
 
         # we should adopt a multi-source reward function here

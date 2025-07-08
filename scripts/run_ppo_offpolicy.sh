@@ -1,26 +1,20 @@
-#!/bin/sh
+#!/bin/bash
 
-#SBATCH -J run_grpo_test
+#SBATCH -J run_ppo_fuse
 #SBATCH -p gpu
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 03:30:00
-#SBATCH --gres=gpu:4
+#SBATCH -t 02:00:00
+#SBATCH --gpus=4
 
 set -x
 
-__conda_setup="$('/shared_ssd_storage/ziyiqiu/anaconda3/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
-if [ $? -eq 0 ]; then
-    eval "$__conda_setup"
-else
-    if [ -f "/shared_ssd_storage/ziyiqiu/anaconda3/etc/profile.d/conda.sh" ]; then
-        . "/shared_ssd_storage/ziyiqiu/anaconda3/etc/profile.d/conda.sh"
-    else
-        export PATH="/shared_ssd_storage/ziyiqiu/anaconda3/bin:$PATH"
-    fi
-fi
-unset __conda_setup
-conda activate test
+module load miniconda/24.9.2
+source activate verl_dev
+
+module load cuda/12.4
+module load nccl/2.23.4-1-cuda12.4
+module load cudnn/8.8.1.3
 
 export HYDRA_FULL_ERROR=1
 # export VLLM_ATTENTION_BACKEND=XFORMERS
@@ -29,13 +23,13 @@ export RAY_DEDUP_LOGS=0
 # export NCCL_IB_DISABLE=1
 
 python3 -m verl.trainer.main_ppo_offpolicy \
-    data.train_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/train.parquet \
-    data.val_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/test.parquet \
-    data.train_batch_size=128 \
-    data.val_batch_size=1312 \
-    data.max_prompt_length=256 \
-    data.max_response_length=1024 \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+    data.train_files=/data/home/scyb166/zyqiu/data/dataset/sky_t1_math/train.parquet \
+    data.val_files=/data/home/scyb166/zyqiu/data/dataset/sky_t1_math/test.parquet \
+    data.train_batch_size=1024 \
+    data.val_batch_size=1204 \
+    data.max_prompt_length=1536 \
+    data.max_response_length=4096 \
+    actor_rollout_ref.model.path=/data/home/scyb166/zyqiu/data/model/qwen2.5_3B/models--Qwen--Qwen2.5-3B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
@@ -48,23 +42,27 @@ python3 -m verl.trainer.main_ppo_offpolicy \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.rollout.partial_rollout_save_steps=450 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=20480 \
+    actor_rollout_ref.rollout.partial_rollout_save_steps=2098 \
+    actor_rollout_ref.rollout.mode='sync' \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
-    critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+    critic.model.path=/data/home/scyb166/zyqiu/data/model/qwen2.5_3B/models--Qwen--Qwen2.5-3B \
     critic.model.enable_gradient_checkpointing=True \
     critic.ppo_micro_batch_size_per_gpu=4 \
     critic.model.fsdp_config.param_offload=True \
+    critic.model.fsdp_config.optimizer_offload=True \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.switch_role=True \
-    trainer.offpolicy_sync_freq=4 \
+    trainer.offpolicy_sync_freq=5 \
     trainer.critic_warmup=0 \
-    trainer.logger=['console'] \
+    trainer.logger=['console','mlflow'] \
     trainer.project_name='verl_gsm8k_0.5B_256' \
-    trainer.experiment_name='sequence-level offpolicy switch+token-level offpolicy' \
+    trainer.experiment_name='sequence-level offpolicy switch and token-level' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    +trainer.rollout_data_dir=/shared_ssd_storage/ziyiqiu/programs/verl_dev/dump/ \
+    +trainer.rollout_data_dir=/data/home/scyb166/zyqiu/verl_dev/dump/3b \
+    +trainer.rollout_length_dir=/data/home/scyb166/zyqiu/verl_dev/dump/3b \
     trainer.save_freq=1000 \
     trainer.test_freq=5 \
     trainer.total_epochs=15 $@ >> output.txt

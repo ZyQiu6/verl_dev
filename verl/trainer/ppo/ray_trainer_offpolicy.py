@@ -35,6 +35,7 @@ from typing import Dict, Optional, Type
 import numpy as np
 import ray
 import torch
+import matplotlib.pyplot as plt
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
@@ -544,6 +545,21 @@ class RayPPOTrainer:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         print(f"Dumped generations to {filename}")
+        
+    def _plot_length(self, response_mask, dump_path):
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.png")
+        
+        response_length = response_mask.sum(dim=-1).numpy()
+        response_length_weight = np.zeros_like(response_length) + 1 / len(response_length)
+        plt.hist(response_length, bins=25, color='skyblue', weights=response_length_weight)
+        plt.title('Length distribution of rollout')
+        plt.xlabel('Length')
+        plt.ylabel('Frequency')
+        plt.savefig(filename)
+        plt.close()
+
+        print(f"Ploted length to {filename}")
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -756,6 +772,17 @@ class RayPPOTrainer:
         
         self.rollout_wg = all_wg['rollout']
         self.rollout_wg.init_model()
+        
+        # create async rollout manager and request scheduler
+        print("create async rollout manager begin")
+        self.async_rollout_mode = False
+        if self.config.actor_rollout_ref.rollout.mode == "async":
+            self.async_rollout_mode = True
+            self.async_rollout_manager = AsyncLLMServerManager(
+                config=self.config.actor_rollout_ref,
+                worker_group=self.rollout_wg,
+            )
+        print("create async rollout manager end")
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -854,12 +881,17 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
-    async def gen_and_store_rollout(self, batch: DataProto, future: DataProtoFuture, partial_rollout_enable=False,
-                                    extra_info={}):
-        still_running = future.futures
-        while len(still_running) > 0:
-            finished, still_running = ray.wait(still_running, num_returns=len(still_running))
-        gen_batch_output = future.get()
+    def gen_and_store_rollout(self, batch: DataProto, gen_batch: DataProto, partial_rollout_enable=False,
+                                extra_info={}, switch_role=False):
+        if switch_role:
+            gen_batch_output = self.actor_wg.generate_sequences(gen_batch)
+        else:
+            if not self.async_rollout_mode:
+                gen_batch_output = self.rollout_wg.generate_sequences(gen_batch)
+            else:
+                self.async_rollout_manager.wake_up()
+                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                self.async_rollout_manager.sleep()
 
         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
             gen_baseline_batch = deepcopy(gen_batch_output)
@@ -907,10 +939,11 @@ class RayPPOTrainer:
         # pad batch
         batch, pad_size = pad_dataproto_to_divisor(batch, self.rollout_wg.world_size)
         # recompute old_log_probs
-        old_log_prob = self.rollout_wg.compute_log_prob(batch)
-        entropys = old_log_prob.batch["entropys"]
-        old_log_prob.batch.pop("entropys")
-        batch = batch.union(old_log_prob)
+        # old_log_prob = self.rollout_wg.compute_log_prob(batch)
+        # entropys = old_log_prob.batch["entropys"]
+        # old_log_prob.batch.pop("entropys")
+        # batch = batch.union(old_log_prob)
+        batch = self.inference(batch)
         # unpad batch
         batch = unpad_dataproto(batch, pad_size=pad_size)
         
@@ -924,19 +957,11 @@ class RayPPOTrainer:
         self.lock.release()
         
         print(f"Gen store_buffer length: {len(self.store_buffer)}")
-        return
-            
-    async def update(self, timing_raw, total_ops, metrics, config={}, stop_flag=False) -> DataProto:
-        train_batch_size = self.config.data.train_batch_size
-        batch = DataProto()
-        while len(batch) < train_batch_size:
-            self.lock.acquire()
-            batch, _ = self.store_buffer.select(train_batch_size, config)
-            self.lock.release()
-        
-        if stop_flag:
-            self.stop_event.set()
-        
+        return batch
+
+    def inference(self, batch) -> DataProto:
+        timing_raw = {}
+        metrics = {}
         with _timer("reward", timing_raw):
             # compute reward model score
             if self.use_rm:
@@ -947,19 +972,7 @@ class RayPPOTrainer:
                 future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
             else:
                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-        
-        # recompute old_log_probs
-        # with _timer("old_log_prob", timing_raw):
-        #     old_log_prob = self.actor_wg.compute_log_prob(batch)
-        #     entropys = old_log_prob.batch["entropys"]
-        #     response_masks = batch.batch["response_mask"]
-        #     loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-        #     entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-        #     old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
-        #     metrics.update(old_log_prob_metrics)
-        #     old_log_prob.batch.pop("entropys")
-        #     batch = batch.union(old_log_prob)
-
+                
         if self.use_reference_policy:
             # compute reference log_prob
             with _timer("ref", timing_raw):
@@ -1005,13 +1018,48 @@ class RayPPOTrainer:
                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                 multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
             )
+            
+        if self.use_critic:
+            with _timer("update_critic", timing_raw):
+                critic_output = self.critic_wg.update_critic(batch)
+            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+            metrics.update(critic_output_metrics)
 
+        return batch
+    
+    def update_critic(self, batch):
+        timing_raw = {}
+        metrics = {}
         # update critic
         if self.use_critic:
             with _timer("update_critic", timing_raw):
                 critic_output = self.critic_wg.update_critic(batch)
             critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
             metrics.update(critic_output_metrics)
+        return
+            
+    async def update(self, timing_raw, total_ops, metrics, config={}, stop_flag=False) -> DataProto:
+        train_batch_size = self.config.data.train_batch_size
+        batch = DataProto()
+        while len(batch) < train_batch_size:
+            self.lock.acquire()
+            batch, _ = self.store_buffer.select(train_batch_size, config)
+            self.lock.release()
+        
+        if stop_flag:
+            self.stop_event.set()
+        
+        # recompute old_log_probs
+        with _timer("old_log_prob", timing_raw):
+            old_log_prob = self.actor_wg.compute_log_prob(batch)
+            entropys = old_log_prob.batch["entropys"]
+            response_masks = batch.batch["response_mask"]
+            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+            entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+            old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+            metrics.update(old_log_prob_metrics)
+            old_log_prob.batch.pop("entropys")
+            batch = batch.union(old_log_prob)
 
         # implement critic warmup
         if self.config.trainer.critic_warmup <= self.global_steps:
@@ -1034,9 +1082,20 @@ class RayPPOTrainer:
                     inputs=inputs,
                     outputs=outputs,
                     scores=scores,
-                    reward_extra_infos_dict=reward_extra_infos_dict,
+                    reward_extra_infos_dict={},
                     dump_path=rollout_data_dir,
                 )
+        
+        # Log response length
+        rollout_length_dir = self.config.trainer.get("rollout_length_dir", None)
+        if rollout_length_dir:
+            with _timer("dump_rollout_length", timing_raw):
+                response_masks = batch.batch["response_mask"]
+                self._plot_length(
+                    response_mask=response_masks,
+                    dump_path=rollout_length_dir,
+                )
+
         return batch
     
     def start_thread_loop(self, loop):
@@ -1070,7 +1129,7 @@ class RayPPOTrainer:
         
         return batch, gen_batch
 
-    def continuous_gen(self, gen_loop, stop_event):
+    def continuous_gen(self, stop_event):
         partial_rollout_enable = False
         if self.config.actor_rollout_ref.rollout.partial_rollout_save_steps:
             partial_rollout_enable = True
@@ -1078,12 +1137,10 @@ class RayPPOTrainer:
         while not stop_event.is_set():
             self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
             batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
-            gen_obj_ref = self.rollout_wg.generate_sequences_offline(gen_batch)
 
             extra_info = {"version": self.global_steps}
-            future = asyncio.run_coroutine_threadsafe(self.gen_and_store_rollout(batch, gen_obj_ref,
-                                                        partial_rollout_enable, extra_info), gen_loop)
-            _ = future.result()
+            new_batch = self.gen_and_store_rollout(batch, gen_batch, partial_rollout_enable, extra_info)
+        # self.update_critic(new_batch)
             
 
     def fit(self):
@@ -1151,32 +1208,15 @@ class RayPPOTrainer:
         self.training_datas = [batch_dict for batch_dict in self.train_dataloader]
         
         while True:
-            if self.global_steps < 10:
-                k = 1
-            else:
-                k = self.config.trainer.offpolicy_sync_freq
-
-            # while cnt < range_max:
-            #     for index, batch_dict in enumerate(self.train_dataloader):
-            #         cnt += 1
-            #         if cnt < range_min:
-            #             continue
-            #         elif cnt > range_max:
-            #             break
-                    
-            #         batch, gen_batch = self.process_input(batch_dict, partial_rollout_enable)
-
-            #         # generate a batch
-            #         batch_list.append(batch)
-            #         gen_obj_ref_list.append(self.rollout_wg.generate_sequences_offline(gen_batch))
+            k = self.config.trainer.offpolicy_sync_freq
             
-            gen_loop = asyncio.new_event_loop()
-            gen_thread = Thread(target=self.start_thread_loop, args=(gen_loop,))
-            gen_thread.start()
+            # gen_loop = asyncio.new_event_loop()
+            # gen_thread = Thread(target=self.start_thread_loop, args=(gen_loop,))
+            # gen_thread.start()
             
             continuous_thread = threading.Thread(
                 target=self.continuous_gen,
-                args=(gen_loop, self.stop_event),
+                args=(self.stop_event,),
                 daemon=True
             )
             continuous_thread.start()
@@ -1210,7 +1250,7 @@ class RayPPOTrainer:
                     if index == k - 1:
                         with _timer("sync_generation_policy", timing_raw):
                             # cancel uncompleted generation tasks
-                            gen_loop.stop()
+                            # gen_loop.stop()
                             # for index in range(len(gen_obj_ref_list)):
                             #     if len(ray.wait(gen_obj_ref_list[index].futures)[0]) == 0:
                             #         for obj_ref in gen_obj_ref_list[index].futures:
@@ -1228,11 +1268,12 @@ class RayPPOTrainer:
                                 if self.config.trainer.switch_role:
                                     extra_info = {"version": self.global_steps+1,}
                                     self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
-                                    batch_switch, gen_batch_switch = self.process_input(self.training_datas[self.gen_batch_index])
-                                    switch_obj_ref = self.actor_wg.generate_sequences_offline(gen_batch_switch)
-                                    switch_task = switch_loop.create_task(self.gen_and_store_rollout(batch_switch, switch_obj_ref,
-                                                                                        extra_info=extra_info))
-                                    switch_loop.run_until_complete(switch_task)
+                                    batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
+                                    # switch_obj_ref = self.actor_wg.generate_sequences_offline(gen_batch_switch)
+                                    # switch_task = switch_loop.create_task(self.gen_and_store_rollout(batch_switch, switch_obj_ref,
+                                    #                                                     extra_info=extra_info, switch_role=True))
+                                    # switch_loop.run_until_complete(switch_task)
+                                    self.gen_and_store_rollout(batch, gen_batch, switch_obj_ref, extra_info=extra_info, switch_role=True)
                                 _, sync_running = ray.wait(sync_running, num_returns=len(sync_running), timeout=0.1)
                             self.stop_event.clear()
 

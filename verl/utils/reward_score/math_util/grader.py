@@ -317,8 +317,7 @@ def symbolic_equal(a, b, tolerance, timeout=10.0):
     def _parse(s):
         for f in [parse_expr, parse_latex]:
             try:
-                with time_limit(timeout):
-                    return f(s)
+                return f(s)
             except Exception:
                 pass
         return s
@@ -327,16 +326,14 @@ def symbolic_equal(a, b, tolerance, timeout=10.0):
     b = _parse(b)
 
     try:
-        with time_limit(timeout):
-            if simplify(a - b) == 0:
-                return True
+        if simplify(a - b) == 0:
+            return True
     except Exception:
         pass
 
     try:
-        with time_limit(timeout):
-            if isclose(N(a), N(b), rel_tol=tolerance):
-                return True
+        if isclose(N(a), N(b), rel_tol=tolerance):
+            return True
     except Exception:
         pass
     return False
