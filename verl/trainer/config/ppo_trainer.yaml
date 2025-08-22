@@ -119,6 +119,7 @@ actor_rollout_ref:
     # for partial rollout
     partial_rollout_save_steps: null
     partial_rollout_mode: recompute # value must be in ['recompute']
+    drain_partial_rollout: True
     engine_kwargs: # inference engine parameters
       swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
     val_kwargs:

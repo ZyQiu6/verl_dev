@@ -694,6 +694,7 @@ class RayPPOTrainer:
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
                 role="actor_rollout",
+                rollout_mode=self.config.actor_rollout_ref.rollout.mode
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:

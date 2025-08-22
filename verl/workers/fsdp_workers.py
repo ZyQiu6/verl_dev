@@ -100,7 +100,7 @@ class ActorRolloutRefWorker(Worker):
     or a hybrid engine based on the config.rollout
     """
 
-    def __init__(self, config: DictConfig, role: str):
+    def __init__(self, config: DictConfig, role: str, rollout_mode: str='sync'):
         super().__init__()
         self.config = config
         import torch.distributed
@@ -109,6 +109,8 @@ class ActorRolloutRefWorker(Worker):
         if not torch.distributed.is_initialized():
             # print(f"init_process_group count={torch.cuda.device_count()} ray={ray.get_gpu_ids()}, self.rank={self.rank}")
             torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
+            
+        self.rollout_mode = rollout_mode
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -406,7 +408,10 @@ class ActorRolloutRefWorker(Worker):
             elif vllm_mode == "spmd":
                 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 
-                vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
+                if self.config.rollout.mode == "async" and self.rollout_mode == "async":
+                    vllm_rollout_cls = vLLMAsyncRollout
+                else:
+                    vllm_rollout_cls = vLLMRollout
                 rollout = vllm_rollout_cls(
                     model_path=local_path,
                     config=self.config.rollout,
@@ -727,7 +732,7 @@ class ActorRolloutRefWorker(Worker):
         return output
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
-    def generate_sequences_offline(self, prompts: DataProto):
+    def generate_sequences_offpolicy(self, prompts: DataProto):
         # Support all hardwares
         prompts = prompts.to(torch.cuda.current_device())
 

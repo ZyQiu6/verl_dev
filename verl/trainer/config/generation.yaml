@@ -40,6 +40,7 @@ rollout:
   # for partial rollout
   partial_rollout_save_steps: null
   partial_rollout_mode: recompute # value must be in ['recompute']
+  drain_partial_rollout: True
   disable_log_stats: True
   enable_chunked_prefill: True
   n: 1
