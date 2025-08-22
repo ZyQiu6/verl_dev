@@ -624,18 +624,23 @@ class RayPPOTrainer:
             )
 
             test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "partial_rollout_enable": False,
+                'eos_token_id': self.tokenizer.eos_token_id,
+                'pad_token_id': self.tokenizer.pad_token_id,
+                'recompute_log_prob': False,
+                'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                'validate': True,
+                'partial_rollout_enable': False,
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_wg.world_size)
-            test_output_gen_batch_padded = self.actor_wg.generate_sequences(test_gen_batch_padded)
+            if not self.async_rollout_mode:
+                test_output_gen_batch_padded = self.actor_wg.generate_sequences(test_gen_batch_padded)
+            else:
+                self.async_switch_rollout_manager.wake_up()
+                test_output_gen_batch_padded = self.async_switch_rollout_manager.generate_sequences(test_gen_batch_padded)
+                self.async_switch_rollout_manager.sleep()
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print("validation generation end")
@@ -701,16 +706,18 @@ class RayPPOTrainer:
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor
-        resource_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
-        actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Actor],
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+        actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
                                                  config=self.config.actor_rollout_ref,
-                                                 role='actor_rollout')
-        self.resource_pool_to_cls[resource_pool]['actor'] = actor_rollout_cls
+                                                 role='actor_rollout',
+                                                 rollout_mode=self.config.actor_rollout_ref.rollout.mode)
+        self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
         # create rollout
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
         actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Rollout],
                                                  config=self.config.actor_rollout_ref,
-                                                 role='actor_rollout')
+                                                 role='actor_rollout',
+                                                 rollout_mode=self.config.actor_rollout_ref.rollout.mode)
         self.resource_pool_to_cls[resource_pool]['rollout'] = actor_rollout_cls
 
         # create critic
@@ -739,20 +746,15 @@ class RayPPOTrainer:
         # you should not use `create_colocated_worker_cls`. Instead, directly pass different resource pool to different worker groups.
         # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
         all_wg = {}
-        self.wg_dicts = []
+        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            if len(class_dict) > 1:
-                worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-                wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
-                spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-            else:
-                wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=list(class_dict.values())[0])
-                spawn_wg = {
-                    list(class_dict.keys())[0]: wg_dict,
-                }
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, **wg_kwargs)
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
-            # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
-            self.wg_dicts.append(wg_dict)
 
         if self.use_critic:
             self.critic_wg = all_wg['critic']
@@ -767,21 +769,27 @@ class RayPPOTrainer:
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_wg = all_wg['actor']
+        self.actor_wg = all_wg['actor_rollout']
         self.actor_wg.init_model()
         
         self.rollout_wg = all_wg['rollout']
         self.rollout_wg.init_model()
         
         # create async rollout manager and request scheduler
-        print("create async rollout manager begin")
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
             self.async_rollout_mode = True
             self.async_rollout_manager = AsyncLLMServerManager(
                 config=self.config.actor_rollout_ref,
                 worker_group=self.rollout_wg,
+                actor_name='rollout',
             )
+            self.async_switch_rollout_manager = AsyncLLMServerManager(
+                config=self.config.actor_rollout_ref,
+                worker_group=self.actor_wg,
+                actor_name='switch',
+            )
+            self.prompt_info = {}
         print("create async rollout manager end")
 
     def _save_checkpoint(self):
@@ -890,8 +898,23 @@ class RayPPOTrainer:
                 gen_batch_output = self.rollout_wg.generate_sequences(gen_batch)
             else:
                 self.async_rollout_manager.wake_up()
-                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                self.async_rollout_manager.sleep()
+                for i in range(len(batch)):
+                    self.prompt_info[batch.non_tensor_batch['uid'][i]] = batch[i]
+                batch = None
+                self.async_rollout_manager.generate_sequences_async(gen_batch)
+                begin_time = time.time()
+                gen_batch_output = self.async_rollout_manager.collect_outputs_async(self.config.data.get("gen_batch_size",
+                                                                                    self.config.data.train_batch_size))
+                print(f"metrics/timing_s/gen: {time.time() - begin_time} s")
+                # gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+        if gen_batch_output is None:
+            return
+        
+        if self.async_rollout_mode and switch_role:
+            for key in ['raw_prompt', 'tools_kwargs', 'multi_modal_inputs']:
+                if key in gen_batch_output.non_tensor_batch.keys():
+                    gen_batch_output.non_tensor_batch.pop(key)
+            print(f"gen_batch_output {gen_batch_output.non_tensor_batch.keys()}")
 
         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
             gen_baseline_batch = deepcopy(gen_batch_output)
@@ -909,8 +932,18 @@ class RayPPOTrainer:
             del gen_baseline_batch, gen_baseline_output
 
         # repeat to align with repeated responses in rollout
-        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    
+        if self.config.actor_rollout_ref.rollout.n > 1 and not self.async_rollout_mode:
+            batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+        #TODO: when n > 1, prompt info have bugs
+        if self.async_rollout_mode and not switch_role:
+            batch_list = []
+            uids = gen_batch_output.non_tensor_batch.pop('uid')
+            for i in range(len(gen_batch_output)):
+                batch_list.append(self.prompt_info.pop(uids[i]))
+            batch = collate_fn(batch_list)
+            batch.meta_info = batch_list[0].meta_info
+
         # save the unfinished seq_group to replay buffer
         if partial_rollout_enable:
             output_finished = gen_batch_output.non_tensor_batch.pop("output_finished")
@@ -932,20 +965,17 @@ class RayPPOTrainer:
         batch = batch.union(gen_batch_output)
         
         batch.batch["response_mask"] = compute_response_mask(batch)
-
-        # compute global_valid tokens
-        batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
         
         # pad batch
-        batch, pad_size = pad_dataproto_to_divisor(batch, self.rollout_wg.world_size)
+        # batch, pad_size = pad_dataproto_to_divisor(batch, self.rollout_wg.world_size)
         # recompute old_log_probs
         # old_log_prob = self.rollout_wg.compute_log_prob(batch)
         # entropys = old_log_prob.batch["entropys"]
         # old_log_prob.batch.pop("entropys")
         # batch = batch.union(old_log_prob)
-        batch = self.inference(batch)
+        # batch = self.inference(batch)
         # unpad batch
-        batch = unpad_dataproto(batch, pad_size=pad_size)
+        # batch = unpad_dataproto(batch, pad_size=pad_size)
         
         info = {}
         if "version" in extra_info:
@@ -984,19 +1014,23 @@ class RayPPOTrainer:
             with _timer("values", timing_raw):
                 values = self.critic_wg.compute_values(batch)
                 batch = batch.union(values)
+        
+        # compute global_valid tokens
+        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+        # we combine with rule-based rm
+        reward_extra_infos_dict: dict[str, list]
+        if self.config.reward_model.launch_reward_fn_async:
+            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+        batch.batch["token_level_scores"] = reward_tensor
+
+        print(f"{list(reward_extra_infos_dict.keys())=}")
+        if reward_extra_infos_dict:
+            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
         with _timer("adv", timing_raw):
             if self.config.trainer.balance_batch:
                 self._balance_batch(batch, metrics=metrics)
-            # we combine with rule-based rm
-            reward_extra_infos_dict: dict[str, list]
-            if self.config.reward_model.launch_reward_fn_async:
-                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-            batch.batch["token_level_scores"] = reward_tensor
-
-            print(f"{list(reward_extra_infos_dict.keys())=}")
-            if reward_extra_infos_dict:
-                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
             # compute rewards. apply_kl_penalty if available
             if self.config.algorithm.use_kl_in_reward:
@@ -1045,9 +1079,14 @@ class RayPPOTrainer:
             self.lock.acquire()
             batch, _ = self.store_buffer.select(train_batch_size, config)
             self.lock.release()
-        
+
         if stop_flag:
             self.stop_event.set()
+            if self.async_rollout_mode:
+                self.async_rollout_manager.stop_generation()
+
+        with _timer("inference", timing_raw):
+            batch = self.inference(batch)
         
         # recompute old_log_probs
         with _timer("old_log_prob", timing_raw):
@@ -1097,10 +1136,6 @@ class RayPPOTrainer:
                 )
 
         return batch
-    
-    def start_thread_loop(self, loop):
-        asyncio.set_event_loop(loop)
-        loop.run_forever()
 
     def process_input(self, batch_dict: dict, partial_rollout_enable=False):
         batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -1120,7 +1155,7 @@ class RayPPOTrainer:
             non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
         )
         gen_batch.meta_info.update({
-            'partial_rollout_enable': partial_rollout_enable,
+            'partial_rollout_enable': partial_rollout_enable or not self.config.actor_rollout_ref.rollout.drain_partial_rollout,
         })
         
         batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
@@ -1134,6 +1169,14 @@ class RayPPOTrainer:
         if self.config.actor_rollout_ref.rollout.partial_rollout_save_steps:
             partial_rollout_enable = True
         
+        if self.async_rollout_mode:
+            self.async_rollout_manager.wake_up()
+            self.async_rollout_manager.start_generation()
+            if not self.async_rollout_manager.replay():
+                batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
+                for i in range(len(batch)):
+                    self.prompt_info[batch.non_tensor_batch['uid'][i]] = batch[i]
+                self.async_rollout_manager.generate_sequences_async(gen_batch)
         while not stop_event.is_set():
             self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
             batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
@@ -1141,7 +1184,31 @@ class RayPPOTrainer:
             extra_info = {"version": self.global_steps}
             new_batch = self.gen_and_store_rollout(batch, gen_batch, partial_rollout_enable, extra_info)
         # self.update_critic(new_batch)
-            
+        if self.async_rollout_mode:
+            self.async_rollout_manager.sleep()
+            if self.config.actor_rollout_ref.rollout.drain_partial_rollout:
+                self.prompt_info.clear()
+    
+    def swith_role_gen(self, sync_event):
+        if self.async_rollout_mode:
+            self.async_switch_rollout_manager.wake_up()
+            self.async_switch_rollout_manager.start_generation()
+            if not self.async_switch_rollout_manager.replay():
+                batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], False)
+                for i in range(len(batch)):
+                    self.prompt_info[batch.non_tensor_batch['uid'][i]] = batch[i]
+                self.async_switch_rollout_manager.generate_sequences_async(gen_batch)
+        while not sync_event.is_set():
+            self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
+            batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], False)
+
+            extra_info = {"version": self.global_steps+1}
+            self.gen_and_store_rollout(batch, gen_batch, False, extra_info)
+        # self.update_critic(new_batch)
+        if self.async_rollout_mode:
+            self.async_switch_rollout_manager.sleep()
+            if self.config.actor_rollout_ref.rollout.drain_partial_rollout:
+                self.prompt_info.clear()
 
     def fit(self):
         """
@@ -1203,6 +1270,7 @@ class RayPPOTrainer:
         # switch_obj_ref = None
         
         self.stop_event = threading.Event()
+        self.sync_event = threading.Event()
         self.lock = threading.Lock()
         
         self.training_datas = [batch_dict for batch_dict in self.train_dataloader]
@@ -1210,21 +1278,12 @@ class RayPPOTrainer:
         while True:
             k = self.config.trainer.offpolicy_sync_freq
             
-            # gen_loop = asyncio.new_event_loop()
-            # gen_thread = Thread(target=self.start_thread_loop, args=(gen_loop,))
-            # gen_thread.start()
-            
             continuous_thread = threading.Thread(
                 target=self.continuous_gen,
                 args=(self.stop_event,),
                 daemon=True
             )
             continuous_thread.start()
-
-            # for index in range(len(gen_obj_ref_list)):
-            #     extra_info = {"version": self.global_steps}
-            #     asyncio.run_coroutine_threadsafe(self.gen_and_store_rollout(batch_list[index], gen_obj_ref_list[index],
-            #                                                                 partial_rollout_enable, extra_info), gen_loop)
             
             for index in range(k):
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -1240,7 +1299,7 @@ class RayPPOTrainer:
                     config = {
                         "method": 'm_ratio_new',
                         # "method": 'naive',
-                        "version_ratio": {"version": self.global_steps-index, "ratio": 0.9},
+                        "version_ratio": {"version": self.global_steps-index, "ratio": 0.5},
                     }
                     task = loop.create_task(self.update(timing_raw, total_ops, metrics, config, stop_flag=(index == k-1)))
                     loop.run_until_complete(task)
@@ -1249,12 +1308,6 @@ class RayPPOTrainer:
 
                     if index == k - 1:
                         with _timer("sync_generation_policy", timing_raw):
-                            # cancel uncompleted generation tasks
-                            # gen_loop.stop()
-                            # for index in range(len(gen_obj_ref_list)):
-                            #     if len(ray.wait(gen_obj_ref_list[index].futures)[0]) == 0:
-                            #         for obj_ref in gen_obj_ref_list[index].futures:
-                            #             ray.cancel(obj_ref)
                             # self.stop_event.set()
                             
                             # sync model weights
@@ -1262,19 +1315,25 @@ class RayPPOTrainer:
                             sync_running = self.rollout_wg.sync_actor_model_weights(model_weights)
                             # switch role
                             if self.config.trainer.switch_role:
-                                switch_loop = asyncio.new_event_loop()
-                            switch_obj_ref = None
+                                switch_role_gen = threading.Thread(
+                                    target=self.switch_role_gen,
+                                    args=(self.sync_event,),
+                                    daemon=True
+                                )
+                                switch_role_gen.start()
                             while len(sync_running) > 0:
-                                if self.config.trainer.switch_role:
-                                    extra_info = {"version": self.global_steps+1,}
-                                    self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
-                                    batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
-                                    # switch_obj_ref = self.actor_wg.generate_sequences_offline(gen_batch_switch)
-                                    # switch_task = switch_loop.create_task(self.gen_and_store_rollout(batch_switch, switch_obj_ref,
-                                    #                                                     extra_info=extra_info, switch_role=True))
-                                    # switch_loop.run_until_complete(switch_task)
-                                    self.gen_and_store_rollout(batch, gen_batch, switch_obj_ref, extra_info=extra_info, switch_role=True)
+                                # if self.config.trainer.switch_role:
+                                #     extra_info = {"version": self.global_steps+1}
+                                #     self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
+                                #     batch_switch, gen_batch_switch = self.process_input(self.training_datas[self.gen_batch_index], False)
+                                #     self.gen_and_store_rollout(batch_switch, gen_batch_switch, False, extra_info=extra_info, switch_role=True)
                                 _, sync_running = ray.wait(sync_running, num_returns=len(sync_running), timeout=0.1)
+                            self.sync_event.set()
+                            if self.async_rollout_mode:
+                                self.async_switch_rollout_manager.stop_generation()
+                            if self.config.trainer.switch_role:
+                                switch_role_gen.join()
+                            self.sync_event.clear()
                             self.stop_event.clear()
 
                 # validate
@@ -1315,5 +1374,4 @@ class RayPPOTrainer:
                 progress_bar.update(1)
                 self.global_steps += 1
             
-            # batch_list.clear()
-            # gen_obj_ref_list.clear()
+            # continuous_thread.join()

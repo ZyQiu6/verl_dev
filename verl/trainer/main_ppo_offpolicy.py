@@ -106,7 +106,8 @@ class TaskRunner:
             from verl.single_controller.ray import RayWorkerGroup
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 
-            actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
+            actor_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
+            rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":
@@ -114,7 +115,8 @@ class TaskRunner:
             from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
             from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
 
-            actor_rollout_cls = ActorRolloutRefWorker
+            actor_cls = ActorRolloutRefWorker
+            rollout_cls = ActorRolloutRefWorker
             ray_worker_group_cls = NVMegatronRayWorkerGroup
 
         else:
@@ -123,8 +125,8 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer_offpolicy import ResourcePoolManager, Role
 
         role_worker_mapping = {
-            Role.Rollout: ray.remote(ActorRolloutRefWorker),
-            Role.Actor: ray.remote(ActorRolloutRefWorker),
+            Role.Rollout: ray.remote(rollout_cls),
+            Role.ActorRollout: ray.remote(actor_cls),
             Role.Critic: ray.remote(CriticWorker),
         }
 
@@ -134,14 +136,14 @@ class TaskRunner:
         ref_pool_id = 'ref_pool'
         critic_pool_id = 'critic_pool'
         resource_pool_spec = {
-            actor_pool_id: [config.trainer.n_gpus_per_node // 2] * config.trainer.nnodes,
-            rollout_pool_id: [config.trainer.n_gpus_per_node // 2] * config.trainer.nnodes,
+            actor_pool_id: [config.trainer.n_gpus_per_node-1] * config.trainer.nnodes,
+            rollout_pool_id: [1] * config.trainer.nnodes,
             # critic_pool_id: [config.trainer.n_gpus_per_node // 4] * config.trainer.nnodes,
         }
         mapping = {
-            Role.Actor: actor_pool_id,
+            Role.ActorRollout: actor_pool_id,
             Role.Rollout: rollout_pool_id,
-            Role.Critic: rollout_pool_id,
+            Role.Critic: actor_pool_id,
         }
 
         # we should adopt a multi-source reward function here
