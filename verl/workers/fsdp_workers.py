@@ -385,7 +385,10 @@ class ActorRolloutRefWorker(Worker):
         infer_tp = self.config.rollout.tensor_model_parallel_size
         dp = self.world_size // infer_tp
         assert self.world_size % infer_tp == 0, f"rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}"
-        rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
+        if self.late_init:
+            rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"], group=self.default_group)
+        else:
+            rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
         print(f"rollout_device_mesh={rollout_device_mesh}")
         self.rollout_device_mesh = rollout_device_mesh
         rollout_name = self.config.rollout.name
@@ -509,9 +512,16 @@ class ActorRolloutRefWorker(Worker):
         return rollout, rollout_sharding_manager
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def device_mesh_late_init(self, split_ranks):
+    def create_default_group(self, split_ranks):
         self.default_group = torch.distributed.split_group(split_ranks=split_ranks)
+        return self.default_group
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_default_group(self, default_group):
+        self.default_group = default_group[self.rank]
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def device_mesh_late_init(self):
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size(group=self.default_group)
         print(f"##### ActorRolloutRefWorker World size: {world_size}")
@@ -1104,7 +1114,7 @@ class ActorRolloutRefWorker(Worker):
         return rank
 
 class CriticWorker(Worker):
-    def __init__(self, config):
+    def __init__(self, config, coordinator=None):
         super().__init__()
         import torch.distributed
 
@@ -1112,20 +1122,25 @@ class CriticWorker(Worker):
             torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
         self.config = config
 
-        # build device mesh for Ulysses Sequence Parallel
-        world_size = torch.distributed.get_world_size()
-        from torch.distributed.device_mesh import init_device_mesh
+        if coordinator is None:
+            # build device mesh for Ulysses Sequence Parallel
+            world_size = torch.distributed.get_world_size()
+            from torch.distributed.device_mesh import init_device_mesh
 
-        fsdp_size = self.config.model.fsdp_config.fsdp_size
-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
+            fsdp_size = self.config.model.fsdp_config.fsdp_size
+            self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
 
-        self.ulysses_device_mesh = None
-        self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
-        dp = world_size // self.ulysses_sequence_parallel_size
-        if self.ulysses_sequence_parallel_size > 1:
-            self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
+            self.ulysses_device_mesh = None
+            self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
+            dp = world_size // self.ulysses_sequence_parallel_size
+            if self.ulysses_sequence_parallel_size > 1:
+                self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
 
-        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+            self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+
+            self.late_init = False
+        else:
+            self.late_init = True
 
         # set FSDP offload params
         self._is_offload_param = self.config.model.fsdp_config.param_offload
@@ -1144,6 +1159,27 @@ class CriticWorker(Worker):
             assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
             assert self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu > 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
         self._is_create_fuse_model = False
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_default_group(self, default_group):
+        self.default_group = default_group[self.rank]
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def device_mesh_late_init(self, split_ranks):
+        # build device mesh for Ulysses Sequence Parallel
+        world_size = torch.distributed.get_world_size(group=self.default_group)
+        from torch.distributed.device_mesh import init_device_mesh
+
+        fsdp_size = self.config.model.fsdp_config.fsdp_size
+        self.device_mesh = create_fsdp_device_mesh_from_group(fsdp_size=self.config.actor.fsdp_config.fsdp_size, group=self.default_group)
+
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
+
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary

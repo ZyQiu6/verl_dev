@@ -726,14 +726,6 @@ class RayPPOTrainer:
                                                  coordinator=coordinator,)
         self.resource_pool_to_cls[resource_pool]['rollout'] = actor_rollout_cls
 
-        # init data tansfer group
-        actors = self.actor_wg._workers + self.rollout_wg._workers
-        # methods = [member for member in dir(actor) if callable(getattr(actor, member))]
-        # print("ActorHandler Methods: ", methods)
-        ranks = ray.get([actor.actor_rollout_setup_cross_group.remote() for actor in actors])
-        split_ranks = [ranks[:len(self.actor_wg._workers)], ranks[len(self.actor_wg._workers):]]
-        ray.get([actor.actor_rollout_device_mesh_late_init.remote(split_ranks) for actor in actors])
-
         # create critic
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
@@ -769,6 +761,18 @@ class RayPPOTrainer:
             wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, **wg_kwargs)
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
+        
+        # init data tansfer group
+        actors = self.all_wg['actor_rollout']._workers + self.all_wg['rollout']._workers
+        # methods = [member for member in dir(actor) if callable(getattr(actor, member))]
+        # print("ActorHandler Methods: ", methods)
+        ranks = ray.get([actor.actor_rollout_setup_cross_group.remote() for actor in actors])
+        split_ranks = [ranks[:len(self.all_wg['actor_rollout']._workers)], ranks[len(self.all_wg['actor_rollout']._workers):]]
+        default_group_list = ray.get([actor.actor_rollout_create_default_group.remote(split_ranks) for actor in actors])
+        self.all_wg['actor_rollout'].device_mesh_late_init()
+        if self.use_critic:
+            self.all_wg['critic'].set_default_group(default_group_list[:len(self.actor_wg._workers)])
+            self.all_wg['critic'].device_mesh_late_init()
 
         if self.use_critic:
             self.critic_wg = all_wg['critic']
