@@ -19,8 +19,9 @@ import logging
 import os
 import warnings
 from typing import Union
+import ray
 import time
-
+import socket
 import psutil
 import torch
 import torch.distributed
@@ -100,7 +101,7 @@ class ActorRolloutRefWorker(Worker):
     or a hybrid engine based on the config.rollout
     """
 
-    def __init__(self, config: DictConfig, role: str, rollout_mode: str='sync'):
+    def __init__(self, config: DictConfig, role: str, rollout_mode: str='sync', coordinator=None):
         super().__init__()
         self.config = config
         import torch.distributed
@@ -110,6 +111,7 @@ class ActorRolloutRefWorker(Worker):
             torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
             
         self.rollout_mode = rollout_mode
+        self.coordinator = coordinator
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -1050,22 +1052,29 @@ class ActorRolloutRefWorker(Worker):
             model_state_dict[k] = v.cpu()
         # print(f"to cpu time={time.time()-begin_time}")
 
-        # from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        # from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
-        
-        # begin_time = time.time()
-        # with FSDP.state_dict_type(
-        #     self.actor_module_fsdp,
-        #     StateDictType.FULL_STATE_DICT,
-        #     FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
-        #     FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True),
-        # ):
-        #     model_state_dict = self.actor_module_fsdp.state_dict()
-        # print(f"state_dict_type time={time.time()-begin_time}")
-
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         return model_state_dict
+
+    def setup_cross_group(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(('', 0))
+        port = s.getsockname()[1]
+        s.close()
+        ip = socket.gethostbyname(socket.gethostname())
+
+        rank = ray.get(self.coordinator.register.remote(ip, port))
+        addresses = ray.get(self.coordinator.get_addresses.remote())
+
+        init_method = f"tcp://{addresses[0][0]}:{addresses[0][1]}"
+        torch.distributed.init_process_group(
+            backend='nccl',
+            init_method=init_method,
+            world_size=len(addresses),
+            rank=rank,
+            group_name="cross_group"  # avoid conflicts because of present default group
+        )
+        return True
 
 class CriticWorker(Worker):
     def __init__(self, config):
