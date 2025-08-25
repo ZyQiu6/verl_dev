@@ -800,9 +800,9 @@ class RayPPOTrainer:
 
         # init data tansfer group
         for actor in self.actor_wg._workers + self.rollout_wg._workers:
-            methods = [member for member in dir(actor) if callable(getattr(actor, member))]
-            print("成员方法:", methods)
-            ray.get(actor.setup_cross_group.remote())
+            # methods = [member for member in dir(actor) if callable(getattr(actor, member))]
+            # print("ActorHandler Methods: ", methods)
+            ray.get(actor.actor_rollout_setup_cross_group.remote())
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`

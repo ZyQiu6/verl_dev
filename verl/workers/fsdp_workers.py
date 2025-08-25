@@ -1056,6 +1056,7 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         return model_state_dict
 
+    @register(dispatch_mode=Dispatch.ALL_TO_ALL)
     def setup_cross_group(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind(('', 0))
