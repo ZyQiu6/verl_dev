@@ -151,6 +151,7 @@ class AsyncvLLMServer(AsyncServerBase):
         self.vllm_dp_rank = vllm_dp_rank
         self.wg_prefix = wg_prefix
         self.engine: AsyncLLM = None
+        self.stop_flag = False
 
         # Init user provided chat scheduler in sperate thread.
         self.generation_loop = None
@@ -204,7 +205,6 @@ class AsyncvLLMServer(AsyncServerBase):
             disable_mm_preprocessor_cache=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
-            load_format=load_format,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
