@@ -726,6 +726,14 @@ class RayPPOTrainer:
                                                  coordinator=coordinator,)
         self.resource_pool_to_cls[resource_pool]['rollout'] = actor_rollout_cls
 
+        # init data tansfer group
+        actors = self.actor_wg._workers + self.rollout_wg._workers
+        # methods = [member for member in dir(actor) if callable(getattr(actor, member))]
+        # print("ActorHandler Methods: ", methods)
+        ranks = ray.get([actor.actor_rollout_setup_cross_group.remote() for actor in actors])
+        split_ranks = [ranks[:len(self.actor_wg._workers)], ranks[len(self.actor_wg._workers):]]
+        ray.get([actor.actor_rollout_device_mesh_late_init.remote(split_ranks) for actor in actors])
+
         # create critic
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
@@ -797,12 +805,6 @@ class RayPPOTrainer:
             )
             self.prompt_info = {}
         print("create async rollout manager end")
-
-        # init data tansfer group
-        for actor in self.actor_wg._workers + self.rollout_wg._workers:
-            # methods = [member for member in dir(actor) if callable(getattr(actor, member))]
-            # print("ActorHandler Methods: ", methods)
-            ray.get(actor.actor_rollout_setup_cross_group.remote())
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`

@@ -67,7 +67,7 @@ def create_device_mesh(world_size, fsdp_size):
         device_mesh = init_device_mesh("cuda", mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"])
     return device_mesh
 
-def create_fuse_fsdp_device_mesh(fsdp_size, group=None):
+def create_fsdp_device_mesh_from_group(fsdp_size, group=None):
     if not group:
         return
     
@@ -104,31 +104,35 @@ class ActorRolloutRefWorker(Worker):
     def __init__(self, config: DictConfig, role: str, rollout_mode: str='sync', coordinator=None):
         super().__init__()
         self.config = config
+        self.rollout_mode = rollout_mode
+        self.coordinator = coordinator
         import torch.distributed
         import ray
 
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
-            
-        self.rollout_mode = rollout_mode
-        self.coordinator = coordinator
+        if coordinator is None:
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
+        
+            # build device mesh for FSDP
+            world_size = torch.distributed.get_world_size()
+            print(f"##### ActorRolloutRefWorker World size: {world_size}")
+            print(f"##### ActorRolloutRefWorker init_process_group ray_gpu_ids={ray.get_gpu_ids()}, self.rank={self.rank}")
+            self._train_world_size = world_size
+            # TODO(sgm): support FSDP hybrid shard for larger model
+            self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
 
-        # build device mesh for FSDP
-        world_size = torch.distributed.get_world_size()
-        print(f"##### ActorRolloutRefWorker World size: {world_size}")
-        print(f"##### ActorRolloutRefWorker init_process_group count={torch.cuda.device_count()} ray={ray.get_gpu_ids()}, self.rank={self.rank}")
-        self._train_world_size = world_size
-        # TODO(sgm): support FSDP hybrid shard for larger model
-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
+            # build device mesh for Ulysses Sequence Parallel
+            self.ulysses_device_mesh = None
+            self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
+            dp = world_size // self.ulysses_sequence_parallel_size
+            if self.ulysses_sequence_parallel_size > 1:
+                self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
 
-        # build device mesh for Ulysses Sequence Parallel
-        self.ulysses_device_mesh = None
-        self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
-        dp = world_size // self.ulysses_sequence_parallel_size
-        if self.ulysses_sequence_parallel_size > 1:
-            self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
+            self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
-        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+            self.late_init = False
+        else:
+            self.late_init = True
 
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
@@ -505,6 +509,27 @@ class ActorRolloutRefWorker(Worker):
         return rollout, rollout_sharding_manager
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def device_mesh_late_init(self, split_ranks):
+        self.default_group = torch.distributed.split_group(split_ranks=split_ranks)
+
+        # build device mesh for FSDP
+        world_size = torch.distributed.get_world_size(group=self.default_group)
+        print(f"##### ActorRolloutRefWorker World size: {world_size}")
+        print(f"##### ActorRolloutRefWorker init_process_group ray_gpu_ids={ray.get_gpu_ids()}, self.rank={self.rank}")
+        self._train_world_size = world_size
+        # TODO(sgm): support FSDP hybrid shard for larger model
+        self.device_mesh = create_fsdp_device_mesh_from_group(fsdp_size=self.config.actor.fsdp_config.fsdp_size, group=self.default_group)
+
+        # build device mesh for Ulysses Sequence Parallel
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
+
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
 
@@ -594,7 +619,7 @@ class ActorRolloutRefWorker(Worker):
 
         # inference ranks
         self._is_create_fuse_model = True
-        self.device_mesh_fuse = create_fuse_fsdp_device_mesh(fsdp_size=self.config.actor.fsdp_config.fsdp_size,
+        self.device_mesh_fuse = create_fsdp_device_mesh_from_group(fsdp_size=self.config.actor.fsdp_config.fsdp_size,
                                                             group=self.actor_fsdp_fuse_pg)
         
         self.actor_inference_ranks = split_ranks[0]
@@ -1073,9 +1098,10 @@ class ActorRolloutRefWorker(Worker):
             init_method=init_method,
             world_size=len(addresses),
             rank=rank,
-            group_name="cross_group"  # avoid conflicts because of present default group
+            group_name="cross_group",
         )
-        return True
+
+        return rank
 
 class CriticWorker(Worker):
     def __init__(self, config):
@@ -1319,7 +1345,7 @@ class CriticWorker(Worker):
 
         # inference ranks
         self._is_create_fuse_model = True
-        self.device_mesh_fuse = create_fuse_fsdp_device_mesh(fsdp_size=self.config.model.fsdp_config.fsdp_size,
+        self.device_mesh_fuse = create_fsdp_device_mesh_from_group(fsdp_size=self.config.model.fsdp_config.fsdp_size,
                                                             group=self.critic_fsdp_fuse_pg)
         
         self.critic_inference_ranks = split_ranks[0]
