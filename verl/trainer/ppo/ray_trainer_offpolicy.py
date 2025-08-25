@@ -66,6 +66,7 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from verl.utils.store_buffer import StoreBuffer
+from verl.utils.data_transfer import Coordinator
 
 WorkerType = Type[Worker]
 
@@ -705,19 +706,24 @@ class RayPPOTrainer:
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
+        # init data tansfer group
+        # FIXME: only consider single node
+        coordinator = Coordinator.remote(self.config.trainer.n_gpus_per_node)
         # create actor
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
         actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
                                                  config=self.config.actor_rollout_ref,
                                                  role='actor_rollout',
-                                                 rollout_mode=self.config.actor_rollout_ref.rollout.mode)
+                                                 rollout_mode=self.config.actor_rollout_ref.rollout.mode,
+                                                 coordinator=coordinator,)
         self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
         # create rollout
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
         actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Rollout],
                                                  config=self.config.actor_rollout_ref,
                                                  role='actor_rollout',
-                                                 rollout_mode=self.config.actor_rollout_ref.rollout.mode)
+                                                 rollout_mode=self.config.actor_rollout_ref.rollout.mode,
+                                                 coordinator=coordinator,)
         self.resource_pool_to_cls[resource_pool]['rollout'] = actor_rollout_cls
 
         # create critic
@@ -791,6 +797,10 @@ class RayPPOTrainer:
             )
             self.prompt_info = {}
         print("create async rollout manager end")
+
+        # init data tansfer group
+        for actor in self.actor_wg._workers + self.rollout_wg._workers:
+            ray.get(actor.setup_cross_group.remote())
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
