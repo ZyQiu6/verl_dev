@@ -44,7 +44,7 @@ from tqdm import tqdm
 from threading import Thread
 
 from verl import DataProto, DataProtoFuture
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, collate_fn
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -897,7 +897,7 @@ class RayPPOTrainer:
             if not self.async_rollout_mode:
                 gen_batch_output = self.rollout_wg.generate_sequences(gen_batch)
             else:
-                self.async_rollout_manager.wake_up()
+                # self.async_rollout_manager.wake_up()
                 for i in range(len(batch)):
                     self.prompt_info[batch.non_tensor_batch['uid'][i]] = batch[i]
                 batch = None
@@ -905,9 +905,11 @@ class RayPPOTrainer:
                 begin_time = time.time()
                 gen_batch_output = self.async_rollout_manager.collect_outputs_async(self.config.data.get("gen_batch_size",
                                                                                     self.config.data.train_batch_size))
-                print(f"metrics/timing_s/gen: {time.time() - begin_time} s")
+                if gen_batch_output:
+                    print(f"metrics/timing_s/gen: {time.time() - begin_time} s")
                 # gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
         if gen_batch_output is None:
+            print("Gen batch output is None")
             return
         
         if self.async_rollout_mode and switch_role:
@@ -1171,6 +1173,7 @@ class RayPPOTrainer:
         
         if self.async_rollout_mode:
             self.async_rollout_manager.wake_up()
+            self.async_rollout_manager.wake_up()
             self.async_rollout_manager.start_generation()
             if not self.async_rollout_manager.replay():
                 batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
@@ -1297,8 +1300,8 @@ class RayPPOTrainer:
 
                     loop = asyncio.new_event_loop()
                     config = {
-                        "method": 'm_ratio_new',
-                        # "method": 'naive',
+                        # "method": 'm_ratio_new',
+                        "method": 'naive',
                         "version_ratio": {"version": self.global_steps-index, "ratio": 0.5},
                     }
                     task = loop.create_task(self.update(timing_raw, total_ops, metrics, config, stop_flag=(index == k-1)))

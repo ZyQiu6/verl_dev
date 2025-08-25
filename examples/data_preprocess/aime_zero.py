@@ -52,6 +52,7 @@ if __name__ == "__main__":
                         + "Return your final response within \\boxed{{}}.",
                     },
                 ],
+                "raw_prompt": short_system_prompt + data_entry["question"] + "Return your final response within \\boxed{{}}.",
                 "ability": "math",
                 "reward_model": {
                     "style": "rule",
@@ -82,6 +83,7 @@ if __name__ == "__main__":
                         + "\nReturn your final response within \\boxed{{}}",
                     },
                 ],
+                "raw_prompt": short_system_prompt + data_entry["problem"] + "\nReturn your final response within \\boxed{{}}",
                 "ability": "math",
                 "reward_model": {
                     "style": "rule",
@@ -103,6 +105,7 @@ if __name__ == "__main__":
                         + "\nReturn your final response within \\boxed{{}}",
                     },
                 ],
+                "raw_prompt": short_system_prompt + data_entry["problem"] + "\nReturn your final response within \\boxed{{}}",
                 "ability": "math",
                 "reward_model": {
                     "style": "rule",
@@ -148,6 +151,7 @@ if __name__ == "__main__":
                         + "\nReturn your final response within \\boxed{{}}",
                     },
                 ],
+                "raw_prompt": short_system_prompt + data_entry["question"] + "\nReturn your final response within \\boxed{{}}",
                 "ability": "math",
                 "reward_model": {
                     "style": "rule",
