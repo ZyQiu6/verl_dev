@@ -109,30 +109,25 @@ class ActorRolloutRefWorker(Worker):
         import torch.distributed
         import ray
 
-        if coordinator is None:
-            if not torch.distributed.is_initialized():
-                torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
         
-            # build device mesh for FSDP
-            world_size = torch.distributed.get_world_size()
-            print(f"##### ActorRolloutRefWorker World size: {world_size}")
-            print(f"##### ActorRolloutRefWorker init_process_group ray_gpu_ids={ray.get_gpu_ids()}, self.rank={self.rank}")
-            self._train_world_size = world_size
-            # TODO(sgm): support FSDP hybrid shard for larger model
-            self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
+        # build device mesh for FSDP
+        world_size = torch.distributed.get_world_size()
+        print(f"##### ActorRolloutRefWorker World size: {world_size}")
+        print(f"##### ActorRolloutRefWorker init_process_group ray_gpu_ids={ray.get_gpu_ids()}, self.rank={self.rank}")
+        self._train_world_size = world_size
+        # TODO(sgm): support FSDP hybrid shard for larger model
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
 
-            # build device mesh for Ulysses Sequence Parallel
-            self.ulysses_device_mesh = None
-            self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
-            dp = world_size // self.ulysses_sequence_parallel_size
-            if self.ulysses_sequence_parallel_size > 1:
-                self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
+        # build device mesh for Ulysses Sequence Parallel
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
 
-            self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
-
-            self.late_init = False
-        else:
-            self.late_init = True
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
@@ -385,10 +380,7 @@ class ActorRolloutRefWorker(Worker):
         infer_tp = self.config.rollout.tensor_model_parallel_size
         dp = self.world_size // infer_tp
         assert self.world_size % infer_tp == 0, f"rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}"
-        if self.late_init:
-            rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"], group=self.default_group)
-        else:
-            rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
+        rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
         print(f"rollout_device_mesh={rollout_device_mesh}")
         self.rollout_device_mesh = rollout_device_mesh
         rollout_name = self.config.rollout.name
@@ -510,34 +502,6 @@ class ActorRolloutRefWorker(Worker):
             raise NotImplementedError(f"Rollout name: {self.config.rollout.name} is not supported")
 
         return rollout, rollout_sharding_manager
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def create_default_group(self, split_ranks):
-        self.default_group = torch.distributed.split_group(split_ranks=split_ranks)
-        return self.default_group
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def set_default_group(self, default_group):
-        self.default_group = default_group[self.rank]
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def device_mesh_late_init(self):
-        # build device mesh for FSDP
-        world_size = torch.distributed.get_world_size(group=self.default_group)
-        print(f"##### ActorRolloutRefWorker World size: {world_size}")
-        print(f"##### ActorRolloutRefWorker init_process_group ray_gpu_ids={ray.get_gpu_ids()}, self.rank={self.rank}")
-        self._train_world_size = world_size
-        # TODO(sgm): support FSDP hybrid shard for larger model
-        self.device_mesh = create_fsdp_device_mesh_from_group(fsdp_size=self.config.actor.fsdp_config.fsdp_size, group=self.default_group)
-
-        # build device mesh for Ulysses Sequence Parallel
-        self.ulysses_device_mesh = None
-        self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
-        dp = world_size // self.ulysses_sequence_parallel_size
-        if self.ulysses_sequence_parallel_size > 1:
-            self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
-
-        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -1091,27 +1055,74 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         return model_state_dict
 
-    @register(dispatch_mode=Dispatch.ALL_TO_ALL)
-    def setup_cross_group(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(('', 0))
-        port = s.getsockname()[1]
-        s.close()
-        ip = socket.gethostbyname(socket.gethostname())
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def setup_ray_collective(self, world_size, rank):
+        from ray.util.collective import init_collective_group
 
-        rank = ray.get(self.coordinator.register.remote(ip, port))
-        addresses = ray.get(self.coordinator.get_addresses.remote())
-
-        init_method = f"tcp://{addresses[0][0]}:{addresses[0][1]}"
-        torch.distributed.init_process_group(
-            backend='nccl',
-            init_method=init_method,
-            world_size=len(addresses),
+        init_collective_group(
+            world_size=world_size,
             rank=rank,
-            group_name="cross_group",
+            backend="nccl",
+            group_name="default"
         )
+        return True
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_actor_weights_info(self, weights_info):
+        assert self._is_rollout
+        self._weights_info = weights_info
 
-        return rank
+    def _get_actor_params(self):
+        assert self._is_actor
+        params = self.actor_module_fsdp.state_dict()
+        from verl.utils.model import convert_weight_keys
+
+        params = convert_weight_keys(params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp))
+        return params
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_actor_weights_info(self):
+        assert self._is_actor
+        if hasattr(self, "_weights_info"):
+            return self._weights_info
+        if fsdp_version(self.actor_module_fsdp) == 1:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp.api import ShardedStateDictConfig, StateDictType
+
+            FSDP.set_state_dict_type(
+                self.actor_module_fsdp,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=ShardedStateDictConfig(),
+            )
+        params = self._get_actor_params()
+        ret = []
+        for key, tensor in params.items():
+            ret.append((key, tensor.size(), tensor.dtype))
+        self._weights_info = ret
+        return ret
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def sync_rollout_weights(self):
+        from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
+
+        params = self._get_actor_params() if self._is_actor else None
+        if self._is_rollout:
+            inference_model = self.rollout.inference_engine.worker.model_runner.model
+            patch_vllm_moe_model_weight_loader(inference_model)
+        for key, shape, dtype in self._weights_info:
+            tensor = torch.empty(shape, dtype=dtype, device=torch.cuda.current_device())
+            if self._is_actor:
+                assert key in params
+                origin_data = params[key]
+                if hasattr(origin_data, "full_tensor"):
+                    origin_data = origin_data.full_tensor()
+                if torch.distributed.get_rank() == 0:
+                    tensor.copy_(origin_data)
+            from ray.util.collective import collective
+
+            collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+            if self._is_rollout:
+                inference_model.load_weights([(key, tensor)])
 
 class CriticWorker(Worker):
     def __init__(self, config, coordinator=None):
@@ -1122,25 +1133,20 @@ class CriticWorker(Worker):
             torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
         self.config = config
 
-        if coordinator is None:
-            # build device mesh for Ulysses Sequence Parallel
-            world_size = torch.distributed.get_world_size()
-            from torch.distributed.device_mesh import init_device_mesh
+        # build device mesh for Ulysses Sequence Parallel
+        world_size = torch.distributed.get_world_size()
+        from torch.distributed.device_mesh import init_device_mesh
 
-            fsdp_size = self.config.model.fsdp_config.fsdp_size
-            self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
+        fsdp_size = self.config.model.fsdp_config.fsdp_size
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
 
-            self.ulysses_device_mesh = None
-            self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
-            dp = world_size // self.ulysses_sequence_parallel_size
-            if self.ulysses_sequence_parallel_size > 1:
-                self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
 
-            self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
-
-            self.late_init = False
-        else:
-            self.late_init = True
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
         # set FSDP offload params
         self._is_offload_param = self.config.model.fsdp_config.param_offload
@@ -1159,27 +1165,6 @@ class CriticWorker(Worker):
             assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
             assert self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu > 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
         self._is_create_fuse_model = False
-    
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def set_default_group(self, default_group):
-        self.default_group = default_group[self.rank]
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def device_mesh_late_init(self, split_ranks):
-        # build device mesh for Ulysses Sequence Parallel
-        world_size = torch.distributed.get_world_size(group=self.default_group)
-        from torch.distributed.device_mesh import init_device_mesh
-
-        fsdp_size = self.config.model.fsdp_config.fsdp_size
-        self.device_mesh = create_fsdp_device_mesh_from_group(fsdp_size=self.config.actor.fsdp_config.fsdp_size, group=self.default_group)
-
-        self.ulysses_device_mesh = None
-        self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
-        dp = world_size // self.ulysses_sequence_parallel_size
-        if self.ulysses_sequence_parallel_size > 1:
-            self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
-
-        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary

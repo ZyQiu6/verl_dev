@@ -721,7 +721,7 @@ class RayPPOTrainer:
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
         actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Rollout],
                                                  config=self.config.actor_rollout_ref,
-                                                 role='actor_rollout',
+                                                 role='rollout',
                                                  rollout_mode=self.config.actor_rollout_ref.rollout.mode,
                                                  coordinator=coordinator,)
         self.resource_pool_to_cls[resource_pool]['rollout'] = actor_rollout_cls
@@ -763,16 +763,13 @@ class RayPPOTrainer:
             all_wg.update(spawn_wg)
         
         # init data tansfer group
-        actors = self.all_wg['actor_rollout']._workers + self.all_wg['rollout']._workers
         # methods = [member for member in dir(actor) if callable(getattr(actor, member))]
         # print("ActorHandler Methods: ", methods)
-        ranks = ray.get([actor.actor_rollout_setup_cross_group.remote() for actor in actors])
-        split_ranks = [ranks[:len(self.all_wg['actor_rollout']._workers)], ranks[len(self.all_wg['actor_rollout']._workers):]]
-        default_group_list = ray.get([actor.actor_rollout_create_default_group.remote(split_ranks) for actor in actors])
-        self.all_wg['actor_rollout'].device_mesh_late_init()
-        if self.use_critic:
-            self.all_wg['critic'].set_default_group(default_group_list[:len(self.actor_wg._workers)])
-            self.all_wg['critic'].device_mesh_late_init()
+        readys = []
+        for global_rank, actor in enumerate(self.all_wg['actor_rollout']._workers + self.all_wg['rollout']._workers):
+            readys.append(actor.actor_rollout_setup_ray_collective.remote(world_size=self.config.trainer.n_gpus_per_node,
+                                                                          rank=global_rank))
+        ray.get(readys)
 
         if self.use_critic:
             self.critic_wg = all_wg['critic']
@@ -809,6 +806,9 @@ class RayPPOTrainer:
             )
             self.prompt_info = {}
         print("create async rollout manager end")
+
+        weights_info_list = self.actor_wg.get_actor_weights_info()
+        self.rollout_wg.set_actor_weights_info(weights_info_list[0])
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -1281,15 +1281,6 @@ class RayPPOTrainer:
         
         begin_timestamp = time.time()
         
-        partial_rollout_enable = False
-        if self.config.actor_rollout_ref.rollout.partial_rollout_save_steps:
-            partial_rollout_enable = True
-        
-        # for asyncio
-        # gen_loop = None
-        # switch_loop = None
-        # switch_obj_ref = None
-        
         self.stop_event = threading.Event()
         self.sync_event = threading.Event()
         self.lock = threading.Lock()
@@ -1332,8 +1323,11 @@ class RayPPOTrainer:
                             # self.stop_event.set()
                             
                             # sync model weights
-                            model_weights = self.actor_wg.get_actor_model_weights()
-                            sync_running = self.rollout_wg.sync_actor_model_weights(model_weights)
+                            # model_weights = self.actor_wg.get_actor_model_weights()
+                            # sync_running = self.rollout_wg.sync_actor_model_weights(model_weights)
+                            self.actor_wg.sync_rollout_weights()
+                            ray.get(self.rollout_wg.sync_rollout_weights())
+
                             # switch role
                             if self.config.trainer.switch_role:
                                 switch_role_gen = threading.Thread(
