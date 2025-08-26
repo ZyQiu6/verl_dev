@@ -101,11 +101,10 @@ class ActorRolloutRefWorker(Worker):
     or a hybrid engine based on the config.rollout
     """
 
-    def __init__(self, config: DictConfig, role: str, rollout_mode: str='sync', coordinator=None):
+    def __init__(self, config: DictConfig, role: str, rollout_mode: str='sync'):
         super().__init__()
         self.config = config
         self.rollout_mode = rollout_mode
-        self.coordinator = coordinator
         import torch.distributed
         import ray
 
@@ -1125,7 +1124,7 @@ class ActorRolloutRefWorker(Worker):
                 inference_model.load_weights([(key, tensor)])
 
 class CriticWorker(Worker):
-    def __init__(self, config, coordinator=None):
+    def __init__(self, config):
         super().__init__()
         import torch.distributed
 
