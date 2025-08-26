@@ -1084,6 +1084,9 @@ class ActorRolloutRefWorker(Worker):
         assert self._is_actor
         if hasattr(self, "_weights_info"):
             return self._weights_info
+        
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if fsdp_version(self.actor_module_fsdp) == 1:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.fsdp.api import ShardedStateDictConfig, StateDictType
@@ -1098,6 +1101,9 @@ class ActorRolloutRefWorker(Worker):
         for key, tensor in params.items():
             ret.append((key, tensor.size(), tensor.dtype))
         self._weights_info = ret
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         return ret
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
