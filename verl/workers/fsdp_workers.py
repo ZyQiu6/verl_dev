@@ -1110,6 +1110,8 @@ class ActorRolloutRefWorker(Worker):
     def sync_rollout_weights(self):
         from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
 
+        if self._is_actor and self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
         params = self._get_actor_params() if self._is_actor else None
         if self._is_rollout:
             inference_model = self.rollout.inference_engine.worker.model_runner.model
@@ -1128,6 +1130,8 @@ class ActorRolloutRefWorker(Worker):
             collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
             if self._is_rollout:
                 inference_model.load_weights([(key, tensor)])
+        if self._is_actor and self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
 class CriticWorker(Worker):
     def __init__(self, config):
