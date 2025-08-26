@@ -16,6 +16,7 @@ Utilities to create common models from huggingface
 """
 
 import os
+import re
 import warnings
 from typing import Dict, Optional, Type
 
@@ -28,6 +29,7 @@ from transformers import (
     GenerationConfig,
     MistralForSequenceClassification,
     PretrainedConfig,
+    PreTrainedModel
 )
 
 from verl.models.registry import ModelRegistry
@@ -156,6 +158,27 @@ def print_model_size(model: nn.Module, name: str = None):
     if name is None:
         name = model.__class__.__name__
     print(f"{name} contains {n_params:.2f}{scale} parameters")
+
+
+def convert_weight_keys(state_dict: dict[str, torch.Tensor], model: PreTrainedModel):
+    # convert state dict keys: https://github.com/huggingface/transformers/pull/38385
+    if not hasattr(model, "_checkpoint_conversion_mapping"):
+        return state_dict
+
+    reverse_key_mapping = {v: k for k, v in model._checkpoint_conversion_mapping.items()}
+    original_weights = {}
+    for key, value in state_dict.items():
+        for pattern, replacement in reverse_key_mapping.items():
+            replacement = replacement.lstrip("^")  # strip off un-needed chars and patterns
+            replacement = re.sub(r"\(.*\)", "", replacement)
+            key, n_replace = re.subn(pattern, replacement, key)
+            # Early exit of the loop
+            if n_replace > 0:
+                break
+
+        original_weights[key] = value
+
+    return original_weights
 
 
 def create_random_mask(
