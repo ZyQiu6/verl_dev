@@ -66,7 +66,6 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from verl.utils.store_buffer import StoreBuffer
-from verl.utils.data_transfer import Coordinator
 
 WorkerType = Type[Worker]
 
