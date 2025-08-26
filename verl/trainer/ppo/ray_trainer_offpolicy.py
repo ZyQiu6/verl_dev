@@ -797,6 +797,8 @@ class RayPPOTrainer:
                 worker_group=self.rollout_wg,
                 actor_name='rollout',
             )
+            self.async_rollout_manager.wake_up()
+            self.async_rollout_manager.wake_up()
             self.async_switch_rollout_manager = AsyncLLMServerManager(
                 config=self.config.actor_rollout_ref,
                 worker_group=self.actor_wg,
@@ -1188,8 +1190,6 @@ class RayPPOTrainer:
             partial_rollout_enable = True
         
         if self.async_rollout_mode:
-            self.async_rollout_manager.wake_up()
-            self.async_rollout_manager.wake_up()
             self.async_rollout_manager.start_generation()
             if not self.async_rollout_manager.replay():
                 batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
@@ -1204,7 +1204,7 @@ class RayPPOTrainer:
             new_batch = self.gen_and_store_rollout(batch, gen_batch, partial_rollout_enable, extra_info)
         # self.update_critic(new_batch)
         if self.async_rollout_mode:
-            self.async_rollout_manager.sleep()
+            # self.async_rollout_manager.sleep()
             if self.config.actor_rollout_ref.rollout.drain_partial_rollout:
                 self.prompt_info.clear()
     
