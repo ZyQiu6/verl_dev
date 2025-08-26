@@ -757,10 +757,10 @@ class RayPPOTrainer:
             all_wg.update(spawn_wg)
         
         # init data tansfer group
-        # methods = [member for member in dir(actor) if callable(getattr(actor, member))]
-        # print("ActorHandler Methods: ", methods)
         readys = []
         for global_rank, actor in enumerate(all_wg['actor_rollout']._workers + all_wg['rollout']._workers):
+            methods = [member for member in dir(actor) if callable(getattr(actor, member))]
+            print("ActorHandler Methods: ", methods)
             readys.append(actor.actor_rollout_setup_ray_collective.remote(world_size=self.config.trainer.n_gpus_per_node,
                                                                           rank=global_rank))
         ray.get(readys)
