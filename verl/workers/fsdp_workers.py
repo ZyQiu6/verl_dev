@@ -1062,7 +1062,7 @@ class ActorRolloutRefWorker(Worker):
             world_size=world_size,
             rank=rank,
             backend="nccl",
-            group_name="default"
+            group_name="actor_rollout"
         )
         return True
     
