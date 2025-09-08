@@ -1129,7 +1129,7 @@ class ActorRolloutRefWorker(Worker):
             inference_model = self.rollout.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(inference_model)
         for key, shape, dtype in self._weights_info:
-            tensor = torch.empty(shape, dtype=dtype, device=torch.cuda.current_device())
+            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
                 assert key in params
                 origin_data = params[key]
