@@ -52,6 +52,11 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
+from verl.utils.device import (
+    get_device_name,
+    get_nccl_backend,
+    get_torch_device,
+)
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
@@ -109,7 +114,14 @@ class ActorRolloutRefWorker(Worker):
         import ray
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(device_id=torch.device(f"cuda:0")) # default backend nccl
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            torch.distributed.init_process_group(
+                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+                rank=rank,
+                world_size=world_size,
+                init_method=os.environ.get("DIST_INIT_METHOD", None),
+            )
         
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
