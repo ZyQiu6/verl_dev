@@ -36,6 +36,7 @@ import numpy as np
 import ray
 import torch
 import matplotlib.pyplot as plt
+import ray.util.collective as collective
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
@@ -757,17 +758,25 @@ class RayPPOTrainer:
             all_wg.update(spawn_wg)
         
         # init data tansfer group
-        readys = []
-        for global_rank, actor in enumerate(all_wg['actor_rollout']._workers + all_wg['rollout']._workers):
-            methods = [member for member in dir(actor) if callable(getattr(actor, member))]
-            # print("ActorHandler Methods: ", methods)
-            if "actor_rollout_setup_ray_collective" in methods:
-                readys.append(actor.actor_rollout_setup_ray_collective.remote(world_size=self.config.trainer.n_gpus_per_node,
-                                                                            rank=global_rank))
-            else:
-                readys.append(actor.rollout_setup_ray_collective.remote(world_size=self.config.trainer.n_gpus_per_node,
-                                                                            rank=global_rank))
-        ray.get(readys)
+        actor_rollout_workers = all_wg['actor_rollout']._workers + all_wg['rollout']._workers
+        collective.create_collective_group(
+            actor_rollout_workers,
+            len(actor_rollout_workers),
+            list(range(0, len(actor_rollout_workers))),
+            backend="nccl",
+            group_name="actor_rollout",
+        )
+        # readys = []
+        # for global_rank, actor in enumerate(all_wg['actor_rollout']._workers + all_wg['rollout']._workers):
+        #     methods = [member for member in dir(actor) if callable(getattr(actor, member))]
+        #     # print("ActorHandler Methods: ", methods)
+        #     if "actor_rollout_setup_ray_collective" in methods:
+        #         readys.append(actor.actor_rollout_setup_ray_collective.remote(world_size=self.config.trainer.n_gpus_per_node,
+        #                                                                     rank=global_rank))
+        #     else:
+        #         readys.append(actor.rollout_setup_ray_collective.remote(world_size=self.config.trainer.n_gpus_per_node,
+        #                                                                     rank=global_rank))
+        # ray.get(readys)
 
         if self.use_critic:
             self.critic_wg = all_wg['critic']
