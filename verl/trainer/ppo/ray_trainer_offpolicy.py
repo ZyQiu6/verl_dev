@@ -36,11 +36,11 @@ import numpy as np
 import ray
 import torch
 import matplotlib.pyplot as plt
-import ray.util.collective as collective
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
+from ray.util.collective import collective
 from tqdm import tqdm
 from threading import Thread
 
