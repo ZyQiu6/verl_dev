@@ -1111,6 +1111,7 @@ class ActorRolloutRefWorker(Worker):
                 state_dict_config=ShardedStateDictConfig(),
             )
         params = self._get_actor_params()
+        params = self.get_actor_model_weights()
         ret = []
         for key, tensor in params.items():
             ret.append((key, tensor.size(), tensor.dtype))
@@ -1134,7 +1135,7 @@ class ActorRolloutRefWorker(Worker):
             patch_vllm_moe_model_weight_loader(inference_model)
         device = torch.cuda.current_device()
         for key, shape, dtype in self._weights_info:
-            tensor = torch.empty(shape, dtype=dtype)
+            tensor = torch.empty(shape, dtype=dtype, device=device)
             if self._is_actor:
                 assert key in params
                 origin_data = params[key]
