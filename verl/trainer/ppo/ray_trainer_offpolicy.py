@@ -1343,13 +1343,13 @@ class RayPPOTrainer:
                                     daemon=True
                                 )
                                 switch_role_gen.start()
-                            while len(sync_running) > 0:
+                            # while len(sync_running) > 0:
                                 # if self.config.trainer.switch_role:
                                 #     extra_info = {"version": self.global_steps+1}
                                 #     self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
                                 #     batch_switch, gen_batch_switch = self.process_input(self.training_datas[self.gen_batch_index], False)
                                 #     self.gen_and_store_rollout(batch_switch, gen_batch_switch, False, extra_info=extra_info, switch_role=True)
-                                _, sync_running = ray.wait(sync_running, num_returns=len(sync_running), timeout=0.1)
+                                # _, sync_running = ray.wait(sync_running, num_returns=len(sync_running), timeout=0.1)
                             self.sync_event.set()
                             if self.async_rollout_mode:
                                 self.async_switch_rollout_manager.stop_generation()
