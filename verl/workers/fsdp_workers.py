@@ -1136,7 +1136,7 @@ class ActorRolloutRefWorker(Worker):
                 assert key in params
                 origin_data = params[key]
                 if self.world_size != 1 and hasattr(origin_data, "full_tensor"):
-                    torch.cuda.barrier()
+                    torch.distributed.barrier()
                     origin_data = origin_data.full_tensor()
                     torch.cuda.synchronize()
                 if torch.distributed.get_rank() == 0:
