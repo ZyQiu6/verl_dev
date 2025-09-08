@@ -122,11 +122,12 @@ class ActorRolloutRefWorker(Worker):
                 world_size=world_size,
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
+            print(f"torch distributed NCCL initial: world_size={world_size}, rank={rank}")
         
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
-        print(f"##### ActorRolloutRefWorker World size: {world_size}")
-        print(f"##### ActorRolloutRefWorker init_process_group ray_gpu_ids={ray.get_gpu_ids()}, self.rank={self.rank}")
+        print(f"ActorRolloutRefWorker World size: {world_size}")
+        print(f"ActorRolloutRefWorker init_process_group ray_gpu_ids={ray.get_gpu_ids()}, self.rank={self.rank}")
         self._train_world_size = world_size
         # TODO(sgm): support FSDP hybrid shard for larger model
         self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
@@ -995,7 +996,8 @@ class ActorRolloutRefWorker(Worker):
             
         params = self.actor_module_fsdp.state_dict()
         device = torch.cuda.current_device()
-        actor_module_weights = {name: param.to(device, non_blocking=True).full_tensor() if self.world_size != 1 and hasattr(param, "full_tensor") else param for name, param in params.items()}
+        actor_module_weights = {name: param.to(device, non_blocking=True).full_tensor() if self.world_size != 1 and hasattr(param, "full_tensor")
+                                else param for name, param in params.items()}
         if self.rank in self.actor_inference_ranks:
             if self._is_offload_param:
                 load_fsdp_model_to_gpu(self.actor_module_fsdp_fuse)
@@ -1130,15 +1132,15 @@ class ActorRolloutRefWorker(Worker):
         if self._is_rollout:
             inference_model = self.rollout.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(inference_model)
+        device = torch.cuda.current_device()
         for key, shape, dtype in self._weights_info:
-            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
+            tensor = torch.empty(shape, dtype=dtype)
             if self._is_actor:
                 assert key in params
                 origin_data = params[key]
                 if self.world_size != 1 and hasattr(origin_data, "full_tensor"):
                     torch.distributed.barrier()
-                    origin_data = origin_data.full_tensor()
-                    torch.cuda.synchronize()
+                    origin_data = origin_data.to(device, non_blocking=True).full_tensor()
                 if torch.distributed.get_rank() == 0:
                     tensor.copy_(origin_data)
             from ray.util.collective import collective
