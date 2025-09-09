@@ -1145,11 +1145,11 @@ class ActorRolloutRefWorker(Worker):
                     tensor.copy_(origin_data)
             from ray.util.collective import collective
 
-            collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
-            if self._is_rollout:
-                rollout_model_weights.append((key, tensor.to(device)))
-                # inference_model.load_weights([(key, tensor)])
-        # if self._is_rollout:
+            collective.broadcast(tensor.to(device), src_rank=0, group_name="actor_rollout")
+            if (not self._is_actor) and self._is_rollout:
+                # rollout_model_weights.append((key, tensor))
+                inference_model.load_weights([(key, tensor)])
+        # if (not self._is_actor) and self._is_rollout:
         #     inference_model.load_weights(rollout_model_weights)
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
