@@ -1135,7 +1135,7 @@ class ActorRolloutRefWorker(Worker):
             patch_vllm_moe_model_weight_loader(inference_model)
         device = torch.cuda.current_device()
         for key, shape, dtype in self._weights_info:
-            tensor = torch.empty(shape, dtype=dtype, device=device)
+            tensor = torch.empty(shape, dtype=dtype)
             if self._is_actor:
                 assert key in params
                 origin_data = params[key]
@@ -1147,10 +1147,10 @@ class ActorRolloutRefWorker(Worker):
 
             collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
             if self._is_rollout:
-                rollout_model_weights.append(key, tensor)
+                rollout_model_weights.append((key, tensor.to(device)))
                 # inference_model.load_weights([(key, tensor)])
-        if self._is_rollout:
-            inference_model.load_weights(rollout_model_weights)
+        # if self._is_rollout:
+        #     inference_model.load_weights(rollout_model_weights)
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
