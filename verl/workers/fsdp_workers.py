@@ -1128,7 +1128,7 @@ class ActorRolloutRefWorker(Worker):
         if self._is_actor and self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         params = self._get_actor_params() if self._is_actor else None
-        torch.distributed.barrier()
+        rollout_model_weights = {}
 
         if self._is_rollout:
             inference_model = self.rollout.inference_engine.worker.model_runner.model
@@ -1140,7 +1140,6 @@ class ActorRolloutRefWorker(Worker):
                 assert key in params
                 origin_data = params[key]
                 if self.world_size != 1 and hasattr(origin_data, "full_tensor"):
-                    torch.distributed.barrier()
                     origin_data = origin_data.to(device, non_blocking=True).full_tensor()
                 if torch.distributed.get_rank() == 0:
                     tensor.copy_(origin_data)
@@ -1148,7 +1147,10 @@ class ActorRolloutRefWorker(Worker):
 
             collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
             if self._is_rollout:
-                inference_model.load_weights([(key, tensor)])
+                rollout_model_weights[key] = tensor
+                # inference_model.load_weights([(key, tensor)])
+        if self._is_rollout:
+            inference_model.load_weights(rollout_model_weights)
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
