@@ -927,7 +927,7 @@ class RayPPOTrainer:
                 # gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
         if gen_batch_output is None:
             print("Gen batch output is None")
-            return
+            return None
         
         if self.async_rollout_mode and switch_role:
             for key in ['raw_prompt', 'tools_kwargs', 'multi_modal_inputs']:
@@ -984,17 +984,6 @@ class RayPPOTrainer:
         batch = batch.union(gen_batch_output)
         
         batch.batch["response_mask"] = compute_response_mask(batch)
-        
-        # pad batch
-        # batch, pad_size = pad_dataproto_to_divisor(batch, self.rollout_wg.world_size)
-        # recompute old_log_probs
-        # old_log_prob = self.rollout_wg.compute_log_prob(batch)
-        # entropys = old_log_prob.batch["entropys"]
-        # old_log_prob.batch.pop("entropys")
-        # batch = batch.union(old_log_prob)
-        # batch = self.inference(batch)
-        # unpad batch
-        # batch = unpad_dataproto(batch, pad_size=pad_size)
         
         info = {}
         if "version" in extra_info:
@@ -1102,7 +1091,7 @@ class RayPPOTrainer:
             metrics.update(critic_output_metrics)
         return
             
-    async def update(self, timing_raw, total_ops, metrics, config={}, stop_flag=False) -> DataProto:
+    async def update(self, timing_raw, metrics, config={}, stop_flag=False) -> DataProto:
         train_batch_size = self.config.data.train_batch_size
         batch = DataProto()
         while len(batch) < train_batch_size:
@@ -1114,9 +1103,9 @@ class RayPPOTrainer:
             self.stop_event.set()
             if self.async_rollout_mode:
                 self.async_rollout_manager.stop_generation()
-
-        with _timer("inference", timing_raw):
-            batch = self.inference(batch)
+        
+        # TODO: reuse the previous batch
+        self.prev_batch = deepcopy(batch)
         
         # recompute old_log_probs
         with _timer("old_log_prob", timing_raw):
@@ -1196,24 +1185,19 @@ class RayPPOTrainer:
 
     def continuous_gen(self, stop_event):
         partial_rollout_enable = False
-        if self.config.actor_rollout_ref.rollout.partial_rollout_save_steps:
-            partial_rollout_enable = True
         
         if self.async_rollout_mode:
             self.async_rollout_manager.start_generation()
-            if not self.async_rollout_manager.replay():
-                batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
-                for i in range(len(batch)):
-                    self.prompt_info[batch.non_tensor_batch['uid'][i]] = batch[i]
-                self.async_rollout_manager.generate_sequences_async(gen_batch)
 
-        self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
         batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
+        self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
         while not stop_event.is_set():
             extra_info = {"version": self.global_steps}
             new_batch = self.gen_and_store_rollout(batch, gen_batch, partial_rollout_enable, extra_info)
             batch = DataProto()
             gen_batch = DataProto()
+            if new_batch is None:
+                break
         # self.update_critic(new_batch)
         if self.async_rollout_mode:
             # self.async_rollout_manager.sleep()
@@ -1295,8 +1279,6 @@ class RayPPOTrainer:
         self.gen_buffer: StoreBuffer = StoreBuffer(DataProto(), {})
         self.inference_buffer: StoreBuffer = StoreBuffer(DataProto(), {})
         
-        # batch_list: list = []
-        # gen_obj_ref: list = []
         self.gen_batch_index = 0
         
         last_val_metrics = None
@@ -1331,18 +1313,16 @@ class RayPPOTrainer:
 
                 metrics = {}
                 timing_raw = {}
-                total_ops = 0
 
                 with _timer('step', timing_raw):
                     print(f'Step: {self.global_steps}')
 
                     loop = asyncio.new_event_loop()
                     config = {
-                        # "method": 'm_ratio_new',
-                        "method": 'naive',
-                        "version_ratio": {"version": self.global_steps-index, "ratio": 0.5},
+                        "method": 'all_new',
+                        "version": self.global_steps-index-k,
                     }
-                    task = loop.create_task(self.update(timing_raw, total_ops, metrics, config, stop_flag=(index == k-1)))
+                    task = loop.create_task(self.update(timing_raw, metrics, config, stop_flag=(index == k-1)))
                     loop.run_until_complete(task)
                     batch = task.result()
                     loop.close()
