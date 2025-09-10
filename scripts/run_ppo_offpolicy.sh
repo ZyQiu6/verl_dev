@@ -31,7 +31,8 @@ export RAY_DEDUP_LOGS=0
 python3 -m verl.trainer.main_ppo_offpolicy \
     data.train_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/train.parquet \
     data.val_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/test.parquet \
-    data.train_batch_size=252 \
+    +data.gen_batch_size=256 \
+    data.train_batch_size=64 \
     data.val_batch_size=1308 \
     data.max_prompt_length=256 \
     data.max_response_length=1024 \

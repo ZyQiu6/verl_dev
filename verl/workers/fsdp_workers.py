@@ -1128,7 +1128,6 @@ class ActorRolloutRefWorker(Worker):
         if self._is_actor and self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         params = self._get_actor_params() if self._is_actor else None
-        rollout_model_weights = []
 
         if self._is_rollout:
             inference_model = self.rollout.inference_engine.worker.model_runner.model
@@ -1147,10 +1146,7 @@ class ActorRolloutRefWorker(Worker):
 
             collective.broadcast(tensor.to(device), src_rank=0, group_name="actor_rollout")
             if (not self._is_actor) and self._is_rollout:
-                # rollout_model_weights.append((key, tensor))
                 inference_model.load_weights([(key, tensor)])
-        # if (not self._is_actor) and self._is_rollout:
-        #     inference_model.load_weights(rollout_model_weights)
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 

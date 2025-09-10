@@ -77,6 +77,19 @@ class StoreBuffer:
                             replay_index.append(i)
             else:
                 return DataProto(), {}
+        elif config["method"] == 'all_new':
+            assert 'version' in config, "when using all_new to select from store buffer, version is needed in config"
+            for i in range(len(self.data)):
+                if self.info["version"][i] >= config["version"]:
+                    select_index.append(i)
+            if len(select_index) >= batch_size:
+                select_index = [select_index[i] for i in range(batch_size)]
+                for i in range(len(self.data)):
+                    if not i in select_index:
+                        if len(select_index) < batch_size:
+                            select_index.append(i)
+                        else:
+                            replay_index.append(i)
         else:
             raise ValueError(f"`method` element of config should be in [`naive`, `m_ratio_new`]")
         batch, self.data = DataProto.separate_by_index(self.data, select_index, replay_index)
@@ -86,3 +99,7 @@ class StoreBuffer:
             self.info[key] = value[replay_index]
             # print(f"After select, data len={len(self.data)}, info len={len(self.info[key])}")
         return batch, batch_info
+    
+    def clear(self):
+        self.data = DataProto()
+        self.info = {}
