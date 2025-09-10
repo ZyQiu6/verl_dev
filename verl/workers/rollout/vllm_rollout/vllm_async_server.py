@@ -435,7 +435,7 @@ class AsyncvLLMServer(AsyncServerBase):
                 tasks,
                 return_when=asyncio.FIRST_COMPLETED
             )
-        if self.stop_flag:
+        if self.stop_flag or len(self.output_buffer) < batch_size:
             return None
         self.collect_tasks = list(tasks)
         # while len(self.output_buffer) < batch_size:
