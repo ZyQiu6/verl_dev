@@ -28,7 +28,7 @@ export VLLM_USE_V1=1
 export RAY_DEDUP_LOGS=0
 # export NCCL_IB_DISABLE=1
 
-python3 -m verl.trainer.main_ppo_offpolicy \
+python3 -m verl.trainer.main_ppo_stream \
     data.train_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/train.parquet \
     data.val_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/test.parquet \
     +data.gen_batch_size=1024 \
