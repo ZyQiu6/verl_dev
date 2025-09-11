@@ -18,55 +18,53 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import asyncio
 import json
 import os
-import uuid
-import time
-import asyncio
 import threading
+import time
+import uuid
 from collections import defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
+from threading import Thread
 from typing import Dict, Optional, Type
 
+import matplotlib.pyplot as plt
 import numpy as np
 import ray
 import torch
-import matplotlib.pyplot as plt
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
+from ray.util.collective import collective
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
-from ray.util.collective import collective
 from tqdm import tqdm
-from threading import Thread
 
 from verl import DataProto, DataProtoFuture
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, collate_fn
+from verl.protocol import collate_fn, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.base import Worker
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray import (RayClassWithInitArgs, RayResourcePool,
+                                        RayWorkerGroup)
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
-from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
-    compute_throughout_metrics,
-    compute_timing_metrics,
-    process_validation_metrics,
-)
+from verl.trainer.ppo.metric_utils import (compute_data_metrics,
+                                           compute_throughout_metrics,
+                                           compute_timing_metrics,
+                                           process_validation_metrics)
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-from verl.utils.metric import (
-    reduce_metrics,
-)
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.metric import reduce_metrics
+from verl.utils.seqlen_balancing import (get_seqlen_balanced_partitions,
+                                         log_seqlen_unbalance)
+from verl.utils.store_buffer import StoreBuffer
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
-from verl.utils.store_buffer import StoreBuffer
 
 WorkerType = Type[Worker]
 
@@ -463,7 +461,8 @@ class RayPPOTrainer:
         Creates the train and validation dataloaders.
         """
         # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.trainer.main_ppo_offpolicy import create_rl_dataset, create_rl_sampler
+        from verl.trainer.main_ppo_offpolicy import (create_rl_dataset,
+                                                     create_rl_sampler)
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizer, self.processor)
@@ -474,7 +473,8 @@ class RayPPOTrainer:
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+            from verl.utils.dataset.rl_dataset import \
+                collate_fn as default_collate_fn
 
             collate_fn = default_collate_fn
 
@@ -505,7 +505,7 @@ class RayPPOTrainer:
 
         print(f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: {len(self.val_dataloader)}")
 
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs * self.config.trainer.offpolicy_sync_freq
 
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
@@ -920,8 +920,7 @@ class RayPPOTrainer:
                     self.async_rollout_manager.generate_sequences_async(gen_batch)
                 batch = None
                 begin_time = time.time()
-                gen_batch_output = self.async_rollout_manager.collect_outputs_async(self.config.data.get("gen_batch_size",
-                                                                                    self.config.data.train_batch_size))
+                gen_batch_output = self.async_rollout_manager.collect_outputs_async(self.config.data.train_batch_size)
                 if gen_batch_output:
                     print(f"metrics/timing_s/gen: {time.time() - begin_time} s")
                 # gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
@@ -1071,6 +1070,10 @@ class RayPPOTrainer:
         self.lock.release()
         
         if self.use_critic:
+            # if self.inference_train_batch:
+            #     DataProto.concat([self.inference_train_batch, batch])
+            # else:
+            #     self.inference_train_batch = deepcopy(batch)
             with _timer("update_critic", timing_raw):
                 critic_output = self.critic_wg.update_critic(batch)
             critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
@@ -1291,6 +1294,14 @@ class RayPPOTrainer:
         
         self.training_datas = [batch_dict for batch_dict in self.train_dataloader]
         
+        self.inference_train_batch = None
+        inference_thread = threading.Thread(
+            target=self.continuous_inference,
+            args=(),
+            daemon=True
+        )
+        inference_thread.start()
+        
         while True:
             k = self.config.trainer.offpolicy_sync_freq
             
@@ -1300,13 +1311,6 @@ class RayPPOTrainer:
                 daemon=True
             )
             continuous_thread.start()
-            
-            inference_thread = threading.Thread(
-                target=self.continuous_inference,
-                args=(),
-                daemon=True
-            )
-            inference_thread.start()
             
             for index in range(k):
                 is_last_step = self.global_steps >= self.total_training_steps
