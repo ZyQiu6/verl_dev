@@ -1231,13 +1231,14 @@ class RayPPOTrainer:
     def continuous_inference(self):
         train_batch_size = self.config.data.train_batch_size
         config = {'method': 'naive'}
-        batch = DataProto()
-        while len(batch) < train_batch_size:
-            self.lock.acquire()
-            batch, _ = self.gen_buffer.select(train_batch_size, config)
-            self.lock.release()
-        extra_info = {"version": self.global_steps}
-        batch = self.inference(batch, extra_info=extra_info)
+        while True:
+            batch = DataProto()
+            while len(batch) < train_batch_size:
+                self.lock.acquire()
+                batch, _ = self.gen_buffer.select(train_batch_size, config)
+                self.lock.release()
+            extra_info = {"version": self.global_steps}
+            _ = self.inference(batch, extra_info=extra_info)
 
     def fit(self):
         """
