@@ -182,6 +182,13 @@ class ActorRolloutRefWorker(Worker):
             
         # with fuse enable
         self._is_create_fuse_model = False
+
+        # record excuting time
+        self.time_dict_trace = {
+            'generation': 0,
+            'train': 0,
+            'sync': 0,
+        }
         
         print(f"fsdp_worker world size {world_size} init")
 
@@ -668,6 +675,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        _begin_time = time.time()
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
 
@@ -707,10 +715,12 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        self.time_dict_trace['train'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
+        _begin_time = time.time()
         # Support all hardwares
         prompts = prompts.to(torch.cuda.current_device())
 
@@ -743,10 +753,12 @@ class ActorRolloutRefWorker(Worker):
 
         # clear kv cache
         torch.cuda.empty_cache()
+        self.time_dict_trace['generation'] += (time.time() - _begin_time)
         return output
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def generate_sequences_offpolicy(self, prompts: DataProto):
+        # NOTE: abandoned
         # Support all hardwares
         prompts = prompts.to(torch.cuda.current_device())
 
@@ -784,7 +796,7 @@ class ActorRolloutRefWorker(Worker):
     
     @register(dispatch_mode=Dispatch.TP_ONE_TO_ALL_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED, blocking=False)
     def generate_sequences_fused(self, prompts: DataProto, ranks=None):
-        print("generate_sequences_fused begin")
+        _begin_time = time.time()
         prompts = prompts.to(torch.cuda.current_device())
 
         assert self._is_rollout
@@ -807,10 +819,12 @@ class ActorRolloutRefWorker(Worker):
 
         # clear kv cache
         torch.cuda.empty_cache()
+        self.time_dict_trace['generation'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
+        _begin_time = time.time()
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -844,10 +858,12 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
+        self.time_dict_trace['train'] += (time.time() - _begin_time)
         return output
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
     def compute_log_prob_fused(self, data: DataProto, ranks=None):
+        _begin_time = time.time()
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp_fuse)
@@ -883,10 +899,12 @@ class ActorRolloutRefWorker(Worker):
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
+        self.time_dict_trace['train'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
+        _begin_time = time.time()
         assert self._is_ref
 
         # Support all hardwares
@@ -910,10 +928,12 @@ class ActorRolloutRefWorker(Worker):
         if self.world_size > 1 and fsdp_version(self.ref_policy.actor_module) == 1:
             self.ref_policy.actor_module._handle.reshard(True)
 
+        self.time_dict_trace['train'] += (time.time() - _begin_time)
         return output
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
     def compute_ref_log_prob_fused(self, data: DataProto, ranks=None):
+        _begin_time = time.time()
         assert self._is_ref
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.ref_module_fsdp_fuse)
@@ -942,6 +962,7 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.ref_module_fsdp_fuse)
 
         torch.cuda.empty_cache()
+        self.time_dict_trace['train'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -991,6 +1012,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def sync_fuse_actor_model_weights(self):
+        _begin_time = time.time()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
             
@@ -1017,9 +1039,11 @@ class ActorRolloutRefWorker(Worker):
             
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        self.time_dict_trace['sync'] += (time.time() - _begin_time)
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_actor_model_weights(self, model_weights: dict):
+        _begin_time = time.time()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
             
@@ -1036,10 +1060,6 @@ class ActorRolloutRefWorker(Worker):
                 FullOptimStateDictConfig(offload_to_cpu=True),
             ):
                 self.actor_module_fsdp.load_state_dict(model_weights)
-                # for k, v in model_weights.items():
-                #     if isinstance(v, torch.Tensor):
-                #         model_weights[k] = v.to(f"cuda:{torch.cuda.current_device()}")
-                # set_model_state_dict(self.actor_module_fsdp, model_weights, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
         elif fsdp_strategy == 'fsdp2':
             from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
             
@@ -1048,9 +1068,11 @@ class ActorRolloutRefWorker(Worker):
         
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        self.time_dict_trace['sync'] += (time.time() - _begin_time)
 
     @register(dispatch_mode=Dispatch.ALL_TO_ONE)
     def get_actor_model_weights(self):
+        _begin_time = time.time()
         # only support actor
         assert self._is_actor
         if self._is_offload_param:
@@ -1066,6 +1088,7 @@ class ActorRolloutRefWorker(Worker):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        self.time_dict_trace['sync'] += (time.time() - _begin_time)
         return model_state_dict
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1123,6 +1146,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
+        _begin_time = time.time()
         from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
 
         if self._is_actor and self._is_offload_param:
@@ -1149,6 +1173,7 @@ class ActorRolloutRefWorker(Worker):
                 inference_model.load_weights([(key, tensor)])
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        self.time_dict_trace['sync'] += (time.time() - _begin_time)
 
 class CriticWorker(Worker):
     def __init__(self, config):
@@ -1191,6 +1216,13 @@ class CriticWorker(Worker):
             assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
             assert self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu > 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
         self._is_create_fuse_model = False
+
+        # record excuting time
+        self.time_dict_trace = {
+            'inference': 0,
+            'train': 0,
+            'sync': 0,
+        }
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
@@ -1415,6 +1447,7 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
+        _begin_time = time.time()
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
         # print("compute_values")
@@ -1435,10 +1468,12 @@ class CriticWorker(Worker):
         output = output.to("cpu")
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
+        self.time_dict_trace['inference'] += (time.time() - _begin_time)
         return output
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
     def compute_values_fused(self, data: DataProto, ranks=None):
+        _begin_time = time.time()
         assert self.rank in self.critic_inference_ranks, f"Worker rank {self.rank} not in critic_inference_ranks {self.critic_inference_ranks}"
         
         # Support all hardwares
@@ -1460,10 +1495,12 @@ class CriticWorker(Worker):
         output = output.to('cpu')
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module_fuse)
+        self.time_dict_trace['inference'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
+        _begin_time = time.time()
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
         if self._is_offload_param:
@@ -1499,6 +1536,7 @@ class CriticWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
         output = output.to("cpu")
+        self.time_dict_trace['train'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1537,6 +1575,7 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ALL_TO_ONE)
     def get_critic_model_weights(self):
+        _begin_time = time.time()
         import torch
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
@@ -1556,10 +1595,12 @@ class CriticWorker(Worker):
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
             
+        self.time_dict_trace['sync'] += (time.time() - _begin_time)
         return model_state_dict
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def sync_fuse_critic_model_weights(self):
+        _begin_time = time.time()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
             
@@ -1585,6 +1626,7 @@ class CriticWorker(Worker):
             
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
+        self.time_dict_trace['sync'] += (time.time() - _begin_time)
 
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py
