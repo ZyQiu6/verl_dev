@@ -159,6 +159,11 @@ class AsyncvLLMServer(AsyncServerBase):
         self.generation_thread = threading.Thread(target=self._init_generation_loop, daemon=True)
         self.generation_thread.start()
 
+        # Record executing time
+        self._time_dict_trace = {
+            'generation': 0,
+        }
+
     def _init_generation_loop(self):
         self.generation_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.generation_loop)
@@ -428,6 +433,8 @@ class AsyncvLLMServer(AsyncServerBase):
                 self.prompt_info[request_id] = prompts[batch_index]
 
     async def collect_outputs_async(self, batch_size: int):
+        _begin_time = time.time()
+
         batch_size = int(batch_size)
         tasks = set(self.collect_tasks)
         while len(self.output_buffer) < batch_size and tasks:
@@ -501,9 +508,12 @@ class AsyncvLLMServer(AsyncServerBase):
 
         output_proto = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
         
+        self._time_dict_trace['generation'] += (time.time() - _begin_time)
         return output_proto
 
     async def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        _begin_time = time.time()
+
         partial_rollout_enable = False
         if 'partial_rollout_enable' in prompts.meta_info:
             partial_rollout_enable = prompts.meta_info['partial_rollout_enable']
@@ -617,4 +627,5 @@ class AsyncvLLMServer(AsyncServerBase):
 
         output_proto = DataProto(batch=batch)
         
+        self._time_dict_trace['generation'] += (time.time() - _begin_time)
         return output_proto
