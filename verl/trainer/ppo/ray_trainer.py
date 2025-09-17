@@ -1340,6 +1340,19 @@ class RayPPOTrainer:
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
                 print(f"metrics: {metrics}")
+                
+                gen_ratio = self.actor_rollout_wg.compute_executing_ratio(timing_raw['gen'], stage='generation')
+                actor_train_time = timing_raw['old_log_prob'] + timing_raw['update_actor']
+                train_ratio = self.actor_rollout_wg.compute_executing_ratio(actor_train_time, stage='train')
+                for i in range(self.actor_rollout_wg.world_size):
+                    print(f"for rank {i} in actor_rollout, executing gen ratio = {gen_ratio[i]['generation']}")
+                    print(f"for rank {i} in actor_rollout, executing train ratio = {train_ratio[i]['train']}")
+                if self.use_critic:
+                    inference_ratio = self.critic_wg.compute_executing_ratio(timing_raw['values'], stage='inference')
+                    train_ratio = self.critic_wg.compute_executing_ratio(timing_raw['update_critic'], stage='train')
+                    for i in range(self.critic_wg.world_size):
+                        print(f"for rank {i} in critic, executing inference ratio = {gen_ratio[i]['inference']}")
+                        print(f"for rank {i} in critic, executing train ratio = {train_ratio[i]['train']}")
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
