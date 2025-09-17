@@ -183,6 +183,8 @@ class AsyncLLMServerManager:
     def stop_generation(self):
         ray.get([server.stop_generation.remote() for server in self.async_llm_servers])
 
+    def compute_executing_ratio(self, total_time):
+        return ray.get([server.compute_executing_ratio.remote(total_time) for server in self.async_llm_servers])
 
 def async_server_class(rollout_backend: str) -> Type[AsyncServerBase]:
     """Get async server class.
