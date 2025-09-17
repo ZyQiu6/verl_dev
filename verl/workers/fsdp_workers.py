@@ -184,9 +184,10 @@ class ActorRolloutRefWorker(Worker):
         self._is_create_fuse_model = False
 
         # record excuting time
-        self.time_dict_trace = {
+        self._time_dict_trace = {
             'generation': 0,
             'train': 0,
+            'inference': 0,
             'sync': 0,
         }
         
@@ -715,7 +716,7 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
-        self.time_dict_trace['train'] += (time.time() - _begin_time)
+        self._time_dict_trace['train'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -753,7 +754,7 @@ class ActorRolloutRefWorker(Worker):
 
         # clear kv cache
         torch.cuda.empty_cache()
-        self.time_dict_trace['generation'] += (time.time() - _begin_time)
+        self._time_dict_trace['generation'] += (time.time() - _begin_time)
         return output
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
@@ -819,7 +820,7 @@ class ActorRolloutRefWorker(Worker):
 
         # clear kv cache
         torch.cuda.empty_cache()
-        self.time_dict_trace['generation'] += (time.time() - _begin_time)
+        self._time_dict_trace['generation'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -858,7 +859,7 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
-        self.time_dict_trace['train'] += (time.time() - _begin_time)
+        self._time_dict_trace['train'] += (time.time() - _begin_time)
         return output
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
@@ -899,7 +900,7 @@ class ActorRolloutRefWorker(Worker):
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
-        self.time_dict_trace['train'] += (time.time() - _begin_time)
+        self._time_dict_trace['train'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -928,7 +929,7 @@ class ActorRolloutRefWorker(Worker):
         if self.world_size > 1 and fsdp_version(self.ref_policy.actor_module) == 1:
             self.ref_policy.actor_module._handle.reshard(True)
 
-        self.time_dict_trace['train'] += (time.time() - _begin_time)
+        self._time_dict_trace['inference'] += (time.time() - _begin_time)
         return output
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
@@ -962,7 +963,7 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.ref_module_fsdp_fuse)
 
         torch.cuda.empty_cache()
-        self.time_dict_trace['train'] += (time.time() - _begin_time)
+        self._time_dict_trace['inference'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1039,7 +1040,7 @@ class ActorRolloutRefWorker(Worker):
             
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-        self.time_dict_trace['sync'] += (time.time() - _begin_time)
+        self._time_dict_trace['sync'] += (time.time() - _begin_time)
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_actor_model_weights(self, model_weights: dict):
@@ -1068,7 +1069,7 @@ class ActorRolloutRefWorker(Worker):
         
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-        self.time_dict_trace['sync'] += (time.time() - _begin_time)
+        self._time_dict_trace['sync'] += (time.time() - _begin_time)
 
     @register(dispatch_mode=Dispatch.ALL_TO_ONE)
     def get_actor_model_weights(self):
@@ -1088,7 +1089,7 @@ class ActorRolloutRefWorker(Worker):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-        self.time_dict_trace['sync'] += (time.time() - _begin_time)
+        self._time_dict_trace['sync'] += (time.time() - _begin_time)
         return model_state_dict
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1173,7 +1174,21 @@ class ActorRolloutRefWorker(Worker):
                 inference_model.load_weights([(key, tensor)])
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-        self.time_dict_trace['sync'] += (time.time() - _begin_time)
+        self._time_dict_trace['sync'] += (time.time() - _begin_time)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def compute_executing_ratio(self, total_time, stage=None):
+        executing_ratio = {}
+        for key, value in self._time_dict_trace:
+            if (not stage) or stage in key:
+                executing_ratio[key] = round(value / total_time, 4)
+        self.reset_executing_time(stage)
+        return executing_ratio
+
+    def reset_executing_time(self, stage=None):
+        for key, value in self._time_dict_trace:
+            if (not stage) or stage in key:
+                executing_ratio[key] = 0
 
 class CriticWorker(Worker):
     def __init__(self, config):
@@ -1218,7 +1233,7 @@ class CriticWorker(Worker):
         self._is_create_fuse_model = False
 
         # record excuting time
-        self.time_dict_trace = {
+        self._time_dict_trace = {
             'inference': 0,
             'train': 0,
             'sync': 0,
@@ -1468,7 +1483,7 @@ class CriticWorker(Worker):
         output = output.to("cpu")
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
-        self.time_dict_trace['inference'] += (time.time() - _begin_time)
+        self._time_dict_trace['inference'] += (time.time() - _begin_time)
         return output
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
@@ -1495,7 +1510,7 @@ class CriticWorker(Worker):
         output = output.to('cpu')
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module_fuse)
-        self.time_dict_trace['inference'] += (time.time() - _begin_time)
+        self._time_dict_trace['inference'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -1536,7 +1551,7 @@ class CriticWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
         output = output.to("cpu")
-        self.time_dict_trace['train'] += (time.time() - _begin_time)
+        self._time_dict_trace['train'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1595,7 +1610,7 @@ class CriticWorker(Worker):
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
             
-        self.time_dict_trace['sync'] += (time.time() - _begin_time)
+        self._time_dict_trace['sync'] += (time.time() - _begin_time)
         return model_state_dict
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1626,7 +1641,19 @@ class CriticWorker(Worker):
             
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
-        self.time_dict_trace['sync'] += (time.time() - _begin_time)
+        self._time_dict_trace['sync'] += (time.time() - _begin_time)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def compute_executing_ratio(self, total_time):
+        executing_ratio = {}
+        for key, value in self._time_dict_trace:
+            executing_ratio[key] = round(value / total_time, 4)
+        self.reset_executing_time()
+        return executing_ratio
+
+    def reset_executing_time(self):
+        for key, value in self._time_dict_trace:
+            executing_ratio[key] = 0
 
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py
@@ -1923,7 +1950,6 @@ class RewardModelWorker(Worker):
 
         output = output.to("cpu")
         return output
-
 
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):

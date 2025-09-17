@@ -629,3 +629,8 @@ class AsyncvLLMServer(AsyncServerBase):
         
         self._time_dict_trace['generation'] += (time.time() - _begin_time)
         return output_proto
+
+    def compute_executing_ratio(self, total_time):
+        ratio = round(self._time_dict_trace['generation'] / total_time, 4)
+        self._time_dict_trace['generation'] = 0
+        return ratio
