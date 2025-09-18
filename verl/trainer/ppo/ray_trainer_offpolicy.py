@@ -1208,8 +1208,12 @@ class RayPPOTrainer:
         self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
         batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
         while not stop_event.is_set():
+            _batch = DataProto()
+            _batch.non_tensor_batch = deepcopy(batch.non_tensor_batch)
+            _batch.meta_info = deepcopy(batch.meta_info)
+            _gen_batch = deepcopy(gen_batch)
             extra_info = {"version": self.global_steps}
-            new_batch = self.gen_and_store_rollout(batch, gen_batch, partial_rollout_enable, extra_info)
+            new_batch = self.gen_and_store_rollout(_batch, _gen_batch, partial_rollout_enable, extra_info)
         # self.update_critic(new_batch)
         if self.async_rollout_mode:
             # self.async_rollout_manager.sleep()
