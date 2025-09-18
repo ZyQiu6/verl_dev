@@ -233,6 +233,7 @@ class AsyncvLLMServer(AsyncServerBase):
         self.output_buffer = {} # store request_output
         self.partial_enable_ids = []
         self.replay_buffer: dict[str, dict] = {} # for partial rollout
+        self.length_order = [] # for length schedule testing
 
     async def wake_up(self):
         await self.engine.wake_up()
@@ -411,6 +412,8 @@ class AsyncvLLMServer(AsyncServerBase):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            if len(self.length_order) > 0:
+                prompts.reorder(self.length_order)
             for batch_index, raw_prompt in enumerate(prompts.non_tensor_batch['raw_prompt']):
                 if batch_index < 1:
                     print(f"conversation: {raw_prompt}")
@@ -507,6 +510,12 @@ class AsyncvLLMServer(AsyncServerBase):
         }
 
         output_proto = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        
+        if len(self.length_order) == 0:
+            response_length = response_mask.sum().float().tolist()
+            self.length_order = np.argsort(response_length).tolist()
+        else:
+            self.length_order.reverse()
         
         self._time_dict_trace['generation'] += (time.time() - _begin_time)
         return output_proto

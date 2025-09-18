@@ -1200,15 +1200,14 @@ class RayPPOTrainer:
         
         if self.async_rollout_mode:
             self.async_rollout_manager.start_generation()
-            if not self.async_rollout_manager.replay():
-                batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
-                for i in range(len(batch)):
-                    self.prompt_info[batch.non_tensor_batch['uid'][i]] = batch[i]
-                self.async_rollout_manager.generate_sequences_async(gen_batch)
+            # if not self.async_rollout_manager.replay():
+            #     batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
+            #     for i in range(len(batch)):
+            #         self.prompt_info[batch.non_tensor_batch['uid'][i]] = batch[i]
+            #     self.async_rollout_manager.generate_sequences_async(gen_batch)
+        self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
+        batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
         while not stop_event.is_set():
-            self.gen_batch_index = (self.gen_batch_index + 1) % len(self.train_dataloader)
-            batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
-
             extra_info = {"version": self.global_steps}
             new_batch = self.gen_and_store_rollout(batch, gen_batch, partial_rollout_enable, extra_info)
         # self.update_critic(new_batch)
