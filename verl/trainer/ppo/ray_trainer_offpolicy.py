@@ -1209,6 +1209,7 @@ class RayPPOTrainer:
         batch, gen_batch = self.process_input(self.training_datas[self.gen_batch_index], partial_rollout_enable)
         while not stop_event.is_set():
             _batch = DataProto()
+            _batch.batch = batch.batch
             _batch.non_tensor_batch = deepcopy(batch.non_tensor_batch)
             _batch.meta_info = deepcopy(batch.meta_info)
             _gen_batch = deepcopy(gen_batch)
