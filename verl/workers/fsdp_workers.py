@@ -1644,7 +1644,7 @@ class CriticWorker(Worker):
         self._time_dict_trace['sync'] += (time.time() - _begin_time)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def compute_executing_ratio(self, total_time):
+    def compute_executing_ratio(self, total_time, stage=None):
         executing_ratio = {}
         for key, value in self._time_dict_trace.items():
             executing_ratio[key] = round(value / total_time, 4)
