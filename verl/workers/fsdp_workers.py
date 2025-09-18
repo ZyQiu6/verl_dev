@@ -1188,7 +1188,7 @@ class ActorRolloutRefWorker(Worker):
     def reset_executing_time(self, stage=None):
         for key, value in self._time_dict_trace.items():
             if (not stage) or stage in key:
-                executing_ratio[key] = 0
+                self._time_dict_trace[key] = 0
 
 class CriticWorker(Worker):
     def __init__(self, config):
@@ -1653,7 +1653,7 @@ class CriticWorker(Worker):
 
     def reset_executing_time(self):
         for key, value in self._time_dict_trace.items():
-            executing_ratio[key] = 0
+            self._time_dict_trace[key] = 0
 
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py
