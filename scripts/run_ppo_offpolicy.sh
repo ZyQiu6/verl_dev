@@ -70,4 +70,4 @@ python3 -m verl.trainer.main_ppo_offpolicy \
     +trainer.rollout_length_dir=/shared_ssd_storage/ziyiqiu/programs/verl_dev/dump \
     trainer.save_freq=1000 \
     trainer.test_freq=5 \
-    trainer.total_epochs=15 $@ >> output.txt
+    trainer.total_epochs=15 $@ >> output_offpolicy.txt
