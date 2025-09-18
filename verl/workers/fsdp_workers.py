@@ -1179,14 +1179,14 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def compute_executing_ratio(self, total_time, stage=None):
         executing_ratio = {}
-        for key, value in self._time_dict_trace:
+        for key, value in self._time_dict_trace.items():
             if (not stage) or stage in key:
                 executing_ratio[key] = round(value / total_time, 4)
         self.reset_executing_time(stage)
         return executing_ratio
 
     def reset_executing_time(self, stage=None):
-        for key, value in self._time_dict_trace:
+        for key, value in self._time_dict_trace.items():
             if (not stage) or stage in key:
                 executing_ratio[key] = 0
 
@@ -1646,13 +1646,13 @@ class CriticWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def compute_executing_ratio(self, total_time):
         executing_ratio = {}
-        for key, value in self._time_dict_trace:
+        for key, value in self._time_dict_trace.items():
             executing_ratio[key] = round(value / total_time, 4)
         self.reset_executing_time()
         return executing_ratio
 
     def reset_executing_time(self):
-        for key, value in self._time_dict_trace:
+        for key, value in self._time_dict_trace.items():
             executing_ratio[key] = 0
 
 
