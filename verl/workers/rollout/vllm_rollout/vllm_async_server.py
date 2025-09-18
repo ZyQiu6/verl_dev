@@ -511,11 +511,9 @@ class AsyncvLLMServer(AsyncServerBase):
 
         output_proto = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
         
-        if len(self.length_order) == 0:
-            response_length = response_attention_mask.sum(dim=-1).float().tolist()
-            self.length_order = np.argsort(response_length).tolist()
-        else:
-            self.length_order.reverse()
+        response_length = response_attention_mask.sum(dim=-1).float().tolist()
+        self.length_order = np.argsort(response_length).tolist()
+        self.length_order.reverse()
         
         self._time_dict_trace['generation'] += (time.time() - _begin_time)
         return output_proto
