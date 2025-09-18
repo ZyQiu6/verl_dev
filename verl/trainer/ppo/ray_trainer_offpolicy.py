@@ -928,7 +928,6 @@ class RayPPOTrainer:
                 for i in range(len(batch)):
                     self.prompt_info[batch.non_tensor_batch['uid'][i]] = batch[i]
                 batch = None
-                print(f"Gen_batch length: {len(gen_batch)}")
                 self.async_rollout_manager.generate_sequences_async(gen_batch)
                 begin_time = time.time()
                 gen_batch_output = self.async_rollout_manager.collect_outputs_async(self.config.data.get("gen_batch_size",

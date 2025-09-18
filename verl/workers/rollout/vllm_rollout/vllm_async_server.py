@@ -412,9 +412,8 @@ class AsyncvLLMServer(AsyncServerBase):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            if len(self.length_order) > 0:
-                prompts.reorder(self.length_order)
-                print(f"Prompts length: {len(prompts)}")
+            # if len(self.length_order) > 0:
+            #     prompts.reorder(self.length_order)
             for batch_index, raw_prompt in enumerate(prompts.non_tensor_batch['raw_prompt']):
                 if batch_index < 1:
                     print(f"conversation: {raw_prompt}")
