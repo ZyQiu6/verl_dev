@@ -1246,8 +1246,8 @@ class RayPPOTrainer:
                         # balance the number of valid tokens on each dp rank.
                         # Note that this breaks the order of data inside the batch.
                         # Please take care when you implement group based adv computation such as GRPO and rloo
-                        if self.config.trainer.balance_batch:
-                            self._balance_batch(batch, metrics=metrics)
+                        # if self.config.trainer.balance_batch:
+                        #     self._balance_batch(batch, metrics=metrics)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
