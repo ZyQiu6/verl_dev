@@ -885,8 +885,13 @@ class RayPPOTrainer:
         plt.ylabel('Frequency')
         plt.savefig(filename)
         plt.close()
-
         print(f"Ploted length to {filename}")
+        
+        length_file = os.path.join(dump_path, f"length_{self.global_steps}.txt")
+        n = len(response_length)
+        with open(length_file, "w") as f:
+            for i in range(n):
+                f.write(str(response_length[i]) + "\n")
 
     def fit(self):
         """

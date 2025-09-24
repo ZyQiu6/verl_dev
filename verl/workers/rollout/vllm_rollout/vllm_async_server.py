@@ -183,6 +183,7 @@ class AsyncvLLMServer(AsyncServerBase):
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
         max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
         max_model_len = int(max_model_len)
+        max_num_seqs = max_num_batched_tokens // max_model_len
 
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
@@ -212,6 +213,7 @@ class AsyncvLLMServer(AsyncServerBase):
             max_model_len=max_model_len,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=False,
             trust_remote_code=trust_remote_code,
