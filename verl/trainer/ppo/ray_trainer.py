@@ -1356,7 +1356,7 @@ class RayPPOTrainer:
                     inference_ratio = self.critic_wg.compute_executing_ratio(timing_raw['values'], stage='inference')
                     train_ratio = self.critic_wg.compute_executing_ratio(timing_raw['update_critic'], stage='train')
                     for i in range(self.critic_wg.world_size):
-                        print(f"for rank {i} in critic, executing inference ratio = {gen_ratio[i]['inference']}")
+                        print(f"for rank {i} in critic, executing inference ratio = {inference_ratio[i]['inference']}")
                         print(f"for rank {i} in critic, executing train ratio = {train_ratio[i]['train']}")
 
                 if is_last_step:
