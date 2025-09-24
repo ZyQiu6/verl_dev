@@ -942,8 +942,9 @@ class RayPPOTrainer:
         last_val_metrics = None
 
         begin_timestamp = time.time()
+        self.training_datas = [batch_dict for batch_dict in self.train_dataloader]
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for batch_dict in self.training_datas:
                 metrics = {}
                 timing_raw = {}
                 total_ops = 0
@@ -965,6 +966,8 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
                 if "raw_prompt" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
+                if "prompt_id" in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("prompt_id")
                 if "tools_kwargs" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 gen_batch = batch.pop(
