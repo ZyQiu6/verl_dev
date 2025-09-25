@@ -20,7 +20,7 @@ else
     fi
 fi
 unset __conda_setup
-conda activate test
+conda activate wjverl
 
 export HYDRA_FULL_ERROR=1
 # export VLLM_ATTENTION_BACKEND=XFORMERS
@@ -29,8 +29,8 @@ export RAY_DEDUP_LOGS=0
 # export NCCL_IB_DISABLE=1
 
 python3 -m verl.trainer.main_ppo \
-    data.train_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/train.parquet \
-    data.val_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/test.parquet \
+    data.train_files=/shared_ssd_storage/weijia/verl_dev/data/gsm8k/train.parquet \
+    data.val_files=/shared_ssd_storage/weijia/verl_dev/data/gsm8k/test.parquet \
     data.train_batch_size=128 \
     data.val_batch_size=1312 \
     data.max_prompt_length=256 \
@@ -56,7 +56,7 @@ python3 -m verl.trainer.main_ppo \
     critic.model.fsdp_config.param_offload=True \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console'] \
     trainer.project_name='verl_gsm8k_0.5B_256' \
     trainer.experiment_name='original' \
     trainer.n_gpus_per_node=4 \

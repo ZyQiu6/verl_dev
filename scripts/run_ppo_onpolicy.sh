@@ -29,8 +29,8 @@ export RAY_DEDUP_LOGS=0
 # export NCCL_IB_DISABLE=1
 
 python3 -m verl.trainer.main_ppo \
-    data.train_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/train.parquet \
-    data.val_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/test.parquet \
+    data.train_files=/shared_ssd_storage/weijia/verl_dev/data/gsm8k/train.parquet \
+    data.val_files=/shared_ssd_storage/weijia/verl_dev/data/gsm8k/test.parquet \
     data.train_batch_size=128 \
     data.val_batch_size=1312 \
     data.max_prompt_length=256 \
