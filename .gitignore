@@ -141,3 +141,5 @@ outputs
 mlruns
 **.out
 scripts/*.whl
+scripts/*.whl
+scripts/*.whl
