@@ -1,19 +1,41 @@
 #!/bin/sh
+
+#SBATCH -J run_grpo_test
+#SBATCH -p gpu
+#SBATCH -N 1
+#SBATCH -n 1
+#SBATCH -t 03:30:00
+#SBATCH --gres=gpu:4
+
+set -x
+
+__conda_setup="$('/shared_ssd_storage/weijia/miniconda3/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+else
+    if [ -f "/shared_ssd_storage/weijia/miniconda3/etc/profile.d/conda.sh" ]; then
+        . "/shared_ssd_storage/weijia/miniconda3/etc/profile.d/conda.sh"
+    else
+        export PATH="/shared_ssd_storage/weijia/miniconda3/bin:$PATH"
+    fi
+fi
+unset __conda_setup
+conda activate wjverl
+
 export HYDRA_FULL_ERROR=1
 # export VLLM_ATTENTION_BACKEND=XFORMERS
-export VLLM_USE_V1=1
+export VLLM_USE_V1=0
 export RAY_DEDUP_LOGS=0
 # export NCCL_IB_DISABLE=1
-# allenai/OLMoE-1B-7B-0924-Instruct
 
 python3 -m verl.trainer.main_ppo \
-    data.train_files=../data/gsm8k/train.parquet \
-    data.val_files=../data/gsm8k//test.parquet \
+    data.train_files=/shared_ssd_storage/weijia/verl_dev/data/gsm8k/train.parquet \
+    data.val_files=/shared_ssd_storage/weijia/verl_dev/data/gsm8k/test.parquet \
     data.train_batch_size=128 \
     data.val_batch_size=512 \
     data.max_prompt_length=256 \
     data.max_response_length=1024 \
-    actor_rollout_ref.model.path=allenai/OLMoE-1B-7B-0924-Instruct\
+    actor_rollout_ref.model.path=allenai/OLMoE-1B-7B-0924 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
@@ -28,7 +50,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=False \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
-    critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+    critic.model.path=allenai/OLMoE-1B-7B-0924 \
     critic.model.enable_gradient_checkpointing=True \
     critic.ppo_micro_batch_size_per_gpu=4 \
     critic.model.fsdp_config.param_offload=True \
