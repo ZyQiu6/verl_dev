@@ -40,7 +40,6 @@ try:
 except ImportError:
     pass
 
-
 def patch_vllm_moe_model_weight_loader(model):
     # this is a work around to load the weight of vllm fused moe model
     # it is from a bug from vllm 0.8.2

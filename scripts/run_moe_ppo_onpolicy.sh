@@ -3,8 +3,10 @@ export HYDRA_FULL_ERROR=1
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 export VLLM_USE_V1=1
 export RAY_DEDUP_LOGS=0
+export HF_ENDPOINT=https://hf-mirror.com
 # export NCCL_IB_DISABLE=1
 # allenai/OLMoE-1B-7B-0924-Instruct
+# actor_rollout_ref.rollout.load_format='dummy_hf'\
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=../data/gsm8k/train.parquet \
@@ -35,7 +37,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
-    trainer.project_name='verl_gsm8k_olmoe_128' \
+    trainer.project_name='verl_gsm8k_olmoechat' \
     trainer.experiment_name='original' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
@@ -44,4 +46,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.fuse_enable=False \
     trainer.fuse_value=True \
     trainer.fuse_old_log_prob=True \
-    trainer.total_epochs=1 $@ >> firstoutput.txt
+    trainer.total_epochs=1 $@ >> olmoe-output.txt
