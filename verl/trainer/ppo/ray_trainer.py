@@ -968,16 +968,12 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
                 if "raw_prompt" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "prompt_id" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("prompt_id")
                 if "tools_kwargs" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
-                if "prompt_id" in batch.non_tensor_batch:
-                    batch.non_tensor_batch["prompt_id"] = gen_batch.non_tensor_batch["prompt_id"]
                 gen_batch.meta_info.update({
                     'partial_rollout_enable': partial_rollout_enable,
                     'fuse_enable': fuse_enable,
@@ -1295,7 +1291,7 @@ class RayPPOTrainer:
                             
                             token_level_scores = batch_item.batch["token_level_scores"]
                             response = batch_item.batch["responses"]
-                            prompt_id = batch_item.non_tensor_batch["prompt_id"]
+                            prompt_id = hash(tuple(batch_item.batch["prompts"].numpy().tolist()))
                             if prompt_id not in self.history_rollout_tree_dict:
                                 self.history_rollout_tree_dict[prompt_id] = RewardAwareSuffixTree()
                             self.history_rollout_tree_dict.add_node(response.numpy().tolist(), token_level_scores.sum().item())

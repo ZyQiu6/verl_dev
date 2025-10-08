@@ -44,6 +44,8 @@ rollout:
   disable_log_stats: True
   enable_chunked_prefill: True
   n: 1
+  # history rollout speculative decoding
+  use_history_spec_decode: False
 actor:
   strategy: fsdp  # This is for backward-compatibility
   ulysses_sequence_parallel_size: 1 # sp size
