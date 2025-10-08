@@ -685,6 +685,9 @@ class RayPPOTrainer:
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+        
+        # history rollout suffix tree
+        self.history_rollout_tree_dict = {}
 
         # create actor and rollout
         if self.hybrid_engine:
@@ -693,7 +696,8 @@ class RayPPOTrainer:
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
                 role="actor_rollout",
-                rollout_mode=self.config.actor_rollout_ref.rollout.mode
+                rollout_mode=self.config.actor_rollout_ref.rollout.mode,
+                history_trees=self.history_rollout_tree_dict,
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
@@ -937,9 +941,6 @@ class RayPPOTrainer:
         fuse_replay_buffer: DataProto = DataProto()
         fuse_buffer: DataProto = DataProto()
         overlapped_batch: DataProto = DataProto()
-        
-        # history rollout suffix tree
-        self.history_rollout_tree_dict = {}
 
         last_val_metrics = None
 
@@ -1284,17 +1285,18 @@ class RayPPOTrainer:
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
                         
-                    with _timer("update_rollout_suffix_tree", timing_raw):
-                        # TODO: every epoch reset?
-                        for i in range(len(batch)):
-                            batch_item = batch[i]  # DataProtoItem
-                            
-                            token_level_scores = batch_item.batch["token_level_scores"]
-                            response = batch_item.batch["responses"]
-                            prompt_id = hash(tuple(batch_item.batch["prompts"].numpy().tolist()))
-                            if prompt_id not in self.history_rollout_tree_dict:
-                                self.history_rollout_tree_dict[prompt_id] = RewardAwareSuffixTree()
-                            self.history_rollout_tree_dict.add_node(response.numpy().tolist(), token_level_scores.sum().item())
+                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        with _timer("update_rollout_suffix_tree", timing_raw):
+                            # TODO: every epoch reset?
+                            for i in range(len(batch)):
+                                batch_item = batch[i]  # DataProtoItem
+                                
+                                token_level_scores = batch_item.batch["token_level_scores"]
+                                response = batch_item.batch["responses"]
+                                prompt_id = hash(tuple(batch_item.batch["prompts"].numpy().tolist()))
+                                if prompt_id not in self.history_rollout_tree_dict:
+                                    self.history_rollout_tree_dict[prompt_id] = RewardAwareSuffixTree()
+                                self.history_rollout_tree_dict.add_node(response.numpy().tolist(), token_level_scores.sum().item())
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
