@@ -20,7 +20,7 @@ else
     fi
 fi
 unset __conda_setup
-conda activate test
+conda activate verl_dev
 
 export HYDRA_FULL_ERROR=1
 export VLLM_USE_V1=1
