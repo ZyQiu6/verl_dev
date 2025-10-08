@@ -27,6 +27,7 @@ export VLLM_USE_V1=1
 export RAY_DEDUP_LOGS=0
 
 python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
     data.train_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/train.parquet \
     data.val_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/test.parquet \
     data.train_batch_size=1024 \
@@ -46,7 +47,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.rollout.use_history_spec_decode=False \
+    actor_rollout_ref.rollout.n=6 \
+    actor_rollout_ref.rollout.use_history_spec_decode=True \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
     critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \

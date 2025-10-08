@@ -4,7 +4,7 @@
 #SBATCH -p gpu
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 03:30:00
+#SBATCH -t 01:00:00
 #SBATCH --gres=gpu:4
 
 set -x
@@ -63,7 +63,7 @@ python3 -m verl.trainer.main_ppo \
     +trainer.rollout_data_dir=/shared_ssd_storage/ziyiqiu/programs/verl_dev/dump \
     +trainer.rollout_length_dir=/shared_ssd_storage/ziyiqiu/programs/verl_dev/dump \
     trainer.save_freq=1000 \
-    trainer.test_freq=5 \
+    trainer.test_freq=10 \
     trainer.fuse_enable=False \
     trainer.fuse_value=True \
     trainer.fuse_old_log_prob=True \
