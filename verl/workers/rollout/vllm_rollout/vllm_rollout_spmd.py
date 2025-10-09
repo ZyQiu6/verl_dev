@@ -246,6 +246,10 @@ class vLLMRollout(BaseRollout):
                 input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
             elif not isinstance(input_data["prompt_token_ids"], list):
                 raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
+        
+        # used for history tree
+        non_tensor_batch['vllm_inputs'] = np.array([input_data["prompt_token_ids"] for input_data in vllm_inputs], 
+                                                    dtype=object)
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
