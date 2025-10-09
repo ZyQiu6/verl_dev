@@ -1293,7 +1293,7 @@ class RayPPOTrainer:
                                 
                                 token_level_scores = batch_item.batch["token_level_scores"]
                                 response = batch_item.batch["responses"]
-                                prompt_id = hash(tuple(batch_item.batch["prompts"].numpy().tolist()))
+                                prompt_id = str(hash(tuple(batch_item.batch["prompts"].numpy().tolist())))
                                 if prompt_id not in self.history_rollout_tree_dict:
                                     self.history_rollout_tree_dict[prompt_id] = RewardAwareSuffixTree()
                                 else:
