@@ -688,7 +688,7 @@ class RayPPOTrainer:
         # history rollout suffix tree
         if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
             # suffix tree
-            from vllm.v1.spec_decode.global_module.suffix_tree import GlobalRewardAwareSuffixTreeGroup
+            from vllm.v1.spec_decode.global_module.suffix_tree import RewardAwareSuffixTree, GlobalRewardAwareSuffixTreeGroup
             self.history_rollout_trees = GlobalRewardAwareSuffixTreeGroup()
 
         # create actor and rollout
