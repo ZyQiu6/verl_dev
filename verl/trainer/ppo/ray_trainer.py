@@ -688,7 +688,7 @@ class RayPPOTrainer:
         # history rollout suffix tree
         if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
             # suffix tree
-            from vllm.v1.spec_decode.global_module.suffix_tree import RewardAwareSuffixTree, GlobalRewardAwareSuffixTreeGroup
+            from vllm.v1.spec_decode.global_module.suffix_tree import GlobalRewardAwareSuffixTreeGroup
             self.history_rollout_trees = GlobalRewardAwareSuffixTreeGroup()
 
         # create actor and rollout
@@ -1287,6 +1287,7 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
                         
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        from vllm.v1.spec_decode.global_module.suffix_tree import RewardAwareSuffixTree
                         with _timer("update_rollout_suffix_tree", timing_raw):
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
