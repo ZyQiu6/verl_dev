@@ -56,7 +56,6 @@ from verl.trainer.ppo.metric_utils import (compute_data_metrics,
                                            process_validation_metrics)
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-from verl.utils.history_rollout import RewardAwareSuffixTree
 from verl.utils.metric import reduce_metrics
 from verl.utils.seqlen_balancing import (get_seqlen_balanced_partitions,
                                          log_seqlen_unbalance)
@@ -687,7 +686,10 @@ class RayPPOTrainer:
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
         
         # history rollout suffix tree
-        self.history_rollout_tree_dict = {}
+        if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+            # suffix tree
+            from vllm.v1.spec_decode.global_module.suffix_tree import GlobalRewardAwareSuffixTreeGroup
+            self.history_rollout_trees = GlobalRewardAwareSuffixTreeGroup()
 
         # create actor and rollout
         if self.hybrid_engine:
@@ -697,7 +699,6 @@ class RayPPOTrainer:
                 config=self.config.actor_rollout_ref,
                 role="actor_rollout",
                 rollout_mode=self.config.actor_rollout_ref.rollout.mode,
-                history_trees=self.history_rollout_tree_dict,
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
@@ -1287,7 +1288,6 @@ class RayPPOTrainer:
                         
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
                         with _timer("update_rollout_suffix_tree", timing_raw):
-                            # TODO: every epoch reset?
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
                                 
@@ -1295,11 +1295,9 @@ class RayPPOTrainer:
                                 response = batch_item.batch["responses"]
                                 prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
-                                if prompt_id not in self.history_rollout_tree_dict:
-                                    self.history_rollout_tree_dict[prompt_id] = RewardAwareSuffixTree()
-                                else:
-                                    self.history_rollout_tree_dict[prompt_id].clear()
-                                self.history_rollout_tree_dict[prompt_id].add_node(response.numpy().tolist(), token_level_scores.sum().item())
+                                self.history_rollout_trees.delete(prompt_id) # clear the tree every epoch
+                                self.history_rollout_trees.set(prompt_id, RewardAwareSuffixTree())
+                                self.history_rollout_trees._dict[prompt_id].add_node(response.numpy().tolist(), token_level_scores.sum().item())
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:

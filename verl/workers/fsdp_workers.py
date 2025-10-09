@@ -98,12 +98,10 @@ class ActorRolloutRefWorker(Worker):
     or a hybrid engine based on the config.rollout
     """
 
-    def __init__(self, config: DictConfig, role: str, rollout_mode: str='sync',
-                 history_trees: Optional[dict]=None):
+    def __init__(self, config: DictConfig, role: str, rollout_mode: str='sync'):
         super().__init__()
         self.config = config
         self.rollout_mode = rollout_mode
-        self.history_trees = history_trees
         import ray
         import torch.distributed
 
@@ -444,9 +442,7 @@ class ActorRolloutRefWorker(Worker):
                     model_hf_config=self.actor_model_config,
                     device_mesh=rollout_device_mesh,
                     trust_remote_code=trust_remote_code,
-                    history_trees=self.history_trees,
                 )
-                print(f"fsdp trees: {id(self.history_trees)}")
             else:
                 raise NotImplementedError("vllm_mode must be 'customized' or 'spmd'")
 

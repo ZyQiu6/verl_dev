@@ -132,11 +132,7 @@ class vLLMRollout(BaseRollout):
                 "num_speculative_tokens": 5, # no use
                 "prompt_lookup_min": 2,
                 "prompt_lookup_max": 7,
-                "extra_info": {
-                    "history_trees": kwargs.get("history_trees"),
-                },
             }
-            print(f"spmd tree: {id(kwargs.get("history_trees"))}")
         else:
             speculative_config = None
 
