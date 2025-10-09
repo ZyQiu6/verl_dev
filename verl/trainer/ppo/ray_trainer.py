@@ -684,12 +684,6 @@ class RayPPOTrainer:
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
-        
-        # history rollout suffix tree
-        if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
-            # suffix tree
-            from vllm.v1.spec_decode.global_module.suffix_tree import GlobalRewardAwareSuffixTreeGroup
-            self.history_rollout_trees = GlobalRewardAwareSuffixTreeGroup()
 
         # create actor and rollout
         if self.hybrid_engine:
@@ -1287,7 +1281,7 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
                         
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
-                        from vllm.v1.spec_decode.global_module.suffix_tree import RewardAwareSuffixTree
+                        from vllm.v1.spec_decode.global_module.suffix_tree import get_history_trees
                         with _timer("update_rollout_suffix_tree", timing_raw):
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
@@ -1296,12 +1290,10 @@ class RayPPOTrainer:
                                 response = batch_item.batch["responses"]
                                 prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
-                                if i == 0:
-                                    print(f"verl prompt_token_ids={prompt_token_ids}")
-                                    print(f"verl prompt_id={prompt_id}")
-                                self.history_rollout_trees.delete(prompt_id) # clear the tree every epoch
-                                self.history_rollout_trees.set(prompt_id, RewardAwareSuffixTree())
-                                self.history_rollout_trees._dict[prompt_id].add_node(response.numpy().tolist(), token_level_scores.sum().item())
+                                history_rollout_trees = get_history_trees()
+                                history_rollout_trees.delete(prompt_id) # clear the tree every epoch
+                                history_rollout_trees.set(prompt_id, RewardAwareSuffixTree())
+                                history_rollout_trees._dict[prompt_id].add_node(response.numpy().tolist(), token_level_scores.sum().item())
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
