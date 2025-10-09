@@ -65,6 +65,7 @@ if __name__ == "__main__":
                         "content": question,
                     }
                 ],
+                "prompt_id": idx,
                 "raw_prompt": question,
                 "ability": "math",
                 "reward_model": {"style": "rule", "ground_truth": solution},

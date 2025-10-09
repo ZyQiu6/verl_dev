@@ -885,8 +885,13 @@ class RayPPOTrainer:
         plt.ylabel('Frequency')
         plt.savefig(filename)
         plt.close()
-
         print(f"Ploted length to {filename}")
+        
+        length_file = os.path.join(dump_path, f"length_{self.global_steps}.txt")
+        n = len(response_length)
+        with open(length_file, "w") as f:
+            for i in range(n):
+                f.write(str(response_length[i]) + "\n")
 
     def fit(self):
         """
@@ -937,8 +942,9 @@ class RayPPOTrainer:
         last_val_metrics = None
 
         begin_timestamp = time.time()
+        self.training_datas = [batch_dict for batch_dict in self.train_dataloader]
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for batch_dict in self.training_datas:
                 metrics = {}
                 timing_raw = {}
                 total_ops = 0
@@ -960,6 +966,8 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
                 if "raw_prompt" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
+                if "prompt_id" in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("prompt_id")
                 if "tools_kwargs" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 gen_batch = batch.pop(
@@ -1238,8 +1246,8 @@ class RayPPOTrainer:
                         # balance the number of valid tokens on each dp rank.
                         # Note that this breaks the order of data inside the batch.
                         # Please take care when you implement group based adv computation such as GRPO and rloo
-                        if self.config.trainer.balance_batch:
-                            self._balance_batch(batch, metrics=metrics)
+                        # if self.config.trainer.balance_batch:
+                        #     self._balance_batch(batch, metrics=metrics)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1340,6 +1348,19 @@ class RayPPOTrainer:
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
                 print(f"metrics: {metrics}")
+                
+                gen_ratio = self.actor_rollout_wg.compute_executing_ratio(timing_raw['gen'], stage='generation')
+                actor_train_time = timing_raw['old_log_prob'] + timing_raw['update_actor']
+                train_ratio = self.actor_rollout_wg.compute_executing_ratio(actor_train_time, stage='train')
+                for i in range(self.actor_rollout_wg.world_size):
+                    print(f"for rank {i} in actor_rollout, executing gen ratio = {gen_ratio[i]['generation']}")
+                    print(f"for rank {i} in actor_rollout, executing train ratio = {train_ratio[i]['train']}")
+                if self.use_critic:
+                    inference_ratio = self.critic_wg.compute_executing_ratio(timing_raw['values'], stage='inference')
+                    train_ratio = self.critic_wg.compute_executing_ratio(timing_raw['update_critic'], stage='train')
+                    for i in range(self.critic_wg.world_size):
+                        print(f"for rank {i} in critic, executing inference ratio = {inference_ratio[i]['inference']}")
+                        print(f"for rank {i} in critic, executing train ratio = {train_ratio[i]['train']}")
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")

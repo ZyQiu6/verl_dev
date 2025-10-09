@@ -159,6 +159,11 @@ class AsyncvLLMServer(AsyncServerBase):
         self.generation_thread = threading.Thread(target=self._init_generation_loop, daemon=True)
         self.generation_thread.start()
 
+        # Record executing time
+        self._time_dict_trace = {
+            'generation': 0,
+        }
+
     def _init_generation_loop(self):
         self.generation_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.generation_loop)
@@ -178,6 +183,7 @@ class AsyncvLLMServer(AsyncServerBase):
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
         max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
         max_model_len = int(max_model_len)
+        max_num_seqs = max_num_batched_tokens // max_model_len
 
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
@@ -207,6 +213,7 @@ class AsyncvLLMServer(AsyncServerBase):
             max_model_len=max_model_len,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
+            # max_num_seqs=max_num_seqs,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=False,
             trust_remote_code=trust_remote_code,
@@ -228,6 +235,7 @@ class AsyncvLLMServer(AsyncServerBase):
         self.output_buffer = {} # store request_output
         self.partial_enable_ids = []
         self.replay_buffer: dict[str, dict] = {} # for partial rollout
+        self.length_order = [] # for length schedule testing
 
     async def wake_up(self):
         await self.engine.wake_up()
@@ -406,6 +414,8 @@ class AsyncvLLMServer(AsyncServerBase):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            # if len(self.length_order) > 0:
+            #     prompts.reorder(self.length_order)
             for batch_index, raw_prompt in enumerate(prompts.non_tensor_batch['raw_prompt']):
                 if batch_index < 1:
                     print(f"conversation: {raw_prompt}")
@@ -428,6 +438,8 @@ class AsyncvLLMServer(AsyncServerBase):
                 self.prompt_info[request_id] = prompts[batch_index]
 
     async def collect_outputs_async(self, batch_size: int):
+        _begin_time = time.time()
+
         batch_size = int(batch_size)
         tasks = set(self.collect_tasks)
         while len(self.output_buffer) < batch_size and tasks:
@@ -501,9 +513,16 @@ class AsyncvLLMServer(AsyncServerBase):
 
         output_proto = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
         
+        response_length = response_attention_mask.sum(dim=-1).float().tolist()
+        self.length_order = np.argsort(response_length).tolist()
+        self.length_order.reverse()
+        
+        self._time_dict_trace['generation'] += (time.time() - _begin_time)
         return output_proto
 
     async def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        _begin_time = time.time()
+
         partial_rollout_enable = False
         if 'partial_rollout_enable' in prompts.meta_info:
             partial_rollout_enable = prompts.meta_info['partial_rollout_enable']
@@ -617,4 +636,10 @@ class AsyncvLLMServer(AsyncServerBase):
 
         output_proto = DataProto(batch=batch)
         
+        self._time_dict_trace['generation'] += (time.time() - _begin_time)
         return output_proto
+
+    def compute_executing_ratio(self, total_time):
+        ratio = round(self._time_dict_trace['generation'] / total_time, 4)
+        self._time_dict_trace['generation'] = 0
+        return ratio
