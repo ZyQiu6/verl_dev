@@ -1281,7 +1281,7 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
                         
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
-                        from vllm.v1.spec_decode.global_module.suffix_tree import get_history_trees
+                        from vllm.v1.spec_decode.global_module.suffix_tree import get_history_trees, RewardAwareSuffixTree
                         with _timer("update_rollout_suffix_tree", timing_raw):
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
