@@ -106,12 +106,20 @@ class RewardAwareSuffixTree:
 
         return match_nodes
     
-    def predict(self, prefix, wnd_size=0):
-        if wnd_size > 0:
-            self.wnd_size = wnd_size
+    def predict(self, prefix, accept_length=1):
+        if accept_length == 1:
+            self.wnd_size = max(self.wnd_size // 2, 3)
+        elif accept_length > 1 and accept_length < self.wnd_size:
+            self.wnd_size = min(self.wnd_size + 1, 32)
+        elif accept_length == self.wnd_size:
+            self.wnd_size = self.wnd_size * 2
+        else:
+            raise ValueError(f"accept length {accept_length} does not match history tree wnd_size {self.wnd_size}")
+
         predicted_tokens = []
         
         matched_nodes = self.find_path_nodes(prefix)
+        print(f"predict matched nodes num: {len(matched_nodes)}")
         next_token, next_node = best_path_node(matched_nodes)
         if next_token:
             predicted_tokens.append(next_token)
