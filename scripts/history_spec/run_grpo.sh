@@ -47,7 +47,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.rollout.n=6 \
+    actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.use_history_spec_decode=True \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
