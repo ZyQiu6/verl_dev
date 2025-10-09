@@ -126,7 +126,6 @@ class vLLMRollout(BaseRollout):
             limit_mm_per_prompt = {"image": config.get("limit_images")}
             
         if self.config.use_history_spec_decode:
-            assert kwargs.get("history_trees") is not None
             speculative_config = {
                 "method": "history_rollout",
                 "num_speculative_tokens": 5, # no use
