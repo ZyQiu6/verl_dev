@@ -1296,6 +1296,9 @@ class RayPPOTrainer:
                                 response = batch_item.batch["responses"]
                                 prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
+                                if i == 0:
+                                    print(f"verl prompt_token_ids={prompt_token_ids}")
+                                    print(f"verl prompt_id={prompt_id}")
                                 self.history_rollout_trees.delete(prompt_id) # clear the tree every epoch
                                 self.history_rollout_trees.set(prompt_id, RewardAwareSuffixTree())
                                 self.history_rollout_trees._dict[prompt_id].add_node(response.numpy().tolist(), token_level_scores.sum().item())
