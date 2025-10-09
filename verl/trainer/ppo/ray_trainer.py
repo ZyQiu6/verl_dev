@@ -1293,8 +1293,9 @@ class RayPPOTrainer:
                                 
                                 token_level_scores = batch_item.batch["token_level_scores"]
                                 response = batch_item.batch["responses"]
-                                prompt_id = str(hash(tuple(batch_item.non_tensor_batch["responses"])))
-                                print(f"vllm input token ids: {batch_item.non_tensor_batch["responses"]}")
+                                prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
+                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                print(f"vllm input token ids: {prompt_token_ids}")
                                 if prompt_id not in self.history_rollout_tree_dict:
                                     self.history_rollout_tree_dict[prompt_id] = RewardAwareSuffixTree()
                                 else:
