@@ -39,6 +39,10 @@ class TrieNode:
                 best_token = key
                 best_child = node.children[key]
         return best_token, best_child
+    
+    def clear(self):
+        self.children.clear()
+        self.reward = 0
 
 
 class RewardAwareSuffixTree:
@@ -117,3 +121,7 @@ class RewardAwareSuffixTree:
                 predicted_tokens.append(next_token)
         
         return predicted_tokens
+    
+    def clear(self):
+        self.root.clear()
+        self.subpath_index.clear()

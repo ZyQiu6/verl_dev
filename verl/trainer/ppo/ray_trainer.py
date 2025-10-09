@@ -1296,6 +1296,8 @@ class RayPPOTrainer:
                                 prompt_id = hash(tuple(batch_item.batch["prompts"].numpy().tolist()))
                                 if prompt_id not in self.history_rollout_tree_dict:
                                     self.history_rollout_tree_dict[prompt_id] = RewardAwareSuffixTree()
+                                else:
+                                    self.history_rollout_tree_dict[prompt_id].clear()
                                 self.history_rollout_tree_dict[prompt_id].add_node(response.numpy().tolist(), token_level_scores.sum().item())
 
                     # implement critic warmup
