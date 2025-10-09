@@ -129,6 +129,7 @@ class vLLMRollout(BaseRollout):
             assert kwargs.get("history_trees") is not None
             speculative_config = {
                 "method": "history_rollout",
+                "num_speculative_tokens": 5, # no use
                 "prompt_lookup_min": 2,
                 "prompt_lookup_max": 7,
                 "extra_info": {
