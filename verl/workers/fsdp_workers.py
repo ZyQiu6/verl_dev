@@ -446,6 +446,7 @@ class ActorRolloutRefWorker(Worker):
                     trust_remote_code=trust_remote_code,
                     history_trees=self.history_trees,
                 )
+                print(f"fsdp trees: {id(self.history_trees)}")
             else:
                 raise NotImplementedError("vllm_mode must be 'customized' or 'spmd'")
 

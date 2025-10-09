@@ -136,6 +136,7 @@ class vLLMRollout(BaseRollout):
                     "history_trees": kwargs.get("history_trees"),
                 },
             }
+            print(f"spmd tree: {id(kwargs.get("history_trees"))}")
         else:
             speculative_config = None
 
