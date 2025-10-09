@@ -4,7 +4,7 @@
 #SBATCH -p gpu
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 03:30:00
+#SBATCH -t 01:00:00
 #SBATCH --gres=gpu:4
 
 set -x
@@ -20,15 +20,14 @@ else
     fi
 fi
 unset __conda_setup
-conda activate test
+conda activate verl_dev
 
 export HYDRA_FULL_ERROR=1
-# export VLLM_ATTENTION_BACKEND=XFORMERS
-export VLLM_USE_V1=0
+export VLLM_USE_V1=1
 export RAY_DEDUP_LOGS=0
-# export NCCL_IB_DISABLE=1
 
 python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
     data.train_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/train.parquet \
     data.val_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/gsm8k/test.parquet \
     data.train_batch_size=1024 \
@@ -48,6 +47,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=False \
+    actor_rollout_ref.rollout.n=6 \
+    actor_rollout_ref.rollout.use_history_spec_decode=True \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
     critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
@@ -64,7 +65,7 @@ python3 -m verl.trainer.main_ppo \
     +trainer.rollout_data_dir=/shared_ssd_storage/ziyiqiu/programs/verl_dev/dump \
     +trainer.rollout_length_dir=/shared_ssd_storage/ziyiqiu/programs/verl_dev/dump \
     trainer.save_freq=1000 \
-    trainer.test_freq=5 \
+    trainer.test_freq=10 \
     trainer.fuse_enable=False \
     trainer.fuse_value=True \
     trainer.fuse_old_log_prob=True \

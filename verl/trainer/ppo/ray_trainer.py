@@ -21,8 +21,8 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import sys
-import uuid
 import time
+import uuid
 from collections import defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
@@ -30,15 +30,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Dict, Optional, Type
-from copy import deepcopy
-from tensordict import TensorDict
 
+import matplotlib.pyplot as plt
 import numpy as np
 import ray
 import torch
-import matplotlib.pyplot as plt
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -46,22 +45,21 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.base import Worker
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray import (RayClassWithInitArgs, RayResourcePool,
+                                        RayWorkerGroup)
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
-from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
-    compute_throughout_metrics,
-    compute_timing_metrics,
-    process_validation_metrics,
-)
+from verl.trainer.ppo.metric_utils import (compute_data_metrics,
+                                           compute_throughout_metrics,
+                                           compute_timing_metrics,
+                                           process_validation_metrics)
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-from verl.utils.metric import (
-    reduce_metrics,
-)
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.history_rollout import RewardAwareSuffixTree
+from verl.utils.metric import reduce_metrics
+from verl.utils.seqlen_balancing import (get_seqlen_balanced_partitions,
+                                         log_seqlen_unbalance)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
@@ -469,7 +467,8 @@ class RayPPOTrainer:
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+            from verl.utils.dataset.rl_dataset import \
+                collate_fn as default_collate_fn
 
             collate_fn = default_collate_fn
 
@@ -686,6 +685,9 @@ class RayPPOTrainer:
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+        
+        # history rollout suffix tree
+        self.history_rollout_tree_dict = {}
 
         # create actor and rollout
         if self.hybrid_engine:
@@ -694,7 +696,8 @@ class RayPPOTrainer:
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
                 role="actor_rollout",
-                rollout_mode=self.config.actor_rollout_ref.rollout.mode
+                rollout_mode=self.config.actor_rollout_ref.rollout.mode,
+                history_trees=self.history_rollout_tree_dict,
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
@@ -966,8 +969,6 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
                 if "raw_prompt" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "prompt_id" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("prompt_id")
                 if "tools_kwargs" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 gen_batch = batch.pop(
@@ -977,6 +978,7 @@ class RayPPOTrainer:
                 gen_batch.meta_info.update({
                     'partial_rollout_enable': partial_rollout_enable,
                     'fuse_enable': fuse_enable,
+                    'reschedule_point': self.config.trainer.get("reschedule_point", -1),
                 })
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -991,7 +993,11 @@ class RayPPOTrainer:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             self.async_rollout_manager.wake_up()
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            if reschedule_point > 0:
+                                self.async_rollout_manager.self.async_rollout_manager.generate_sequences_async(gen_batch)
+                                gen_batch_output = self.async_rollout_manager.collect_outputs_async(self.config.data.train_batch_size)
+                            else:
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -1279,6 +1285,18 @@ class RayPPOTrainer:
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
                         
+                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        with _timer("update_rollout_suffix_tree", timing_raw):
+                            # TODO: every epoch reset?
+                            for i in range(len(batch)):
+                                batch_item = batch[i]  # DataProtoItem
+                                
+                                token_level_scores = batch_item.batch["token_level_scores"]
+                                response = batch_item.batch["responses"]
+                                prompt_id = hash(tuple(batch_item.batch["prompts"].numpy().tolist()))
+                                if prompt_id not in self.history_rollout_tree_dict:
+                                    self.history_rollout_tree_dict[prompt_id] = RewardAwareSuffixTree()
+                                self.history_rollout_tree_dict[prompt_id].add_node(response.numpy().tolist(), token_level_scores.sum().item())
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:

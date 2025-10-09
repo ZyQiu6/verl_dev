@@ -43,7 +43,8 @@ from vllm.worker.worker_base import WorkerWrapperBase
 from verl import DataProto
 from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
-from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
+from verl.utils.torch_functional import (get_response_mask,
+                                         pad_2d_list_to_length)
 from verl.workers.rollout.base import BaseRollout
 
 logger = logging.getLogger(__file__)
@@ -123,6 +124,20 @@ class vLLMRollout(BaseRollout):
         limit_mm_per_prompt = None
         if config.get("limit_images", None):  # support for multi-image data
             limit_mm_per_prompt = {"image": config.get("limit_images")}
+            
+        if self.config.use_history_spec_decode:
+            assert kwargs.get("history_trees") is not None
+            speculative_config = {
+                "method": "history_rollout",
+                "num_speculative_tokens": 5,
+                "prompt_lookup_min": 2,
+                "prompt_lookup_max": 7,
+                "extra_info": {
+                    "history_trees": kwargs.get("history_trees"),
+                },
+            }
+        else:
+            speculative_config = None
 
         self.inference_engine = LLM(
             model=model_path,
@@ -144,6 +159,7 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            speculative_config=speculative_config,
         )
 
         # Offload vllm model to reduce peak memory usage

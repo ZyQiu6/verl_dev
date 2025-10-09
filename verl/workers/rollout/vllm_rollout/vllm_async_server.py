@@ -262,13 +262,18 @@ class AsyncvLLMServer(AsyncServerBase):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
 
-    async def collect_output(self, output_generator, request_id, do_print=False, async_mode=False):
+    async def collect_output(self, output_generator, request_id, do_print=False, async_mode=False,
+                             reschedule_point=-1):
         final_output = None
         try:
             async for output in output_generator:
                 final_output = output
                 if do_print:
                     print(f"Partial result: {output.outputs[0].text}")
+            for output in final_output.outputs:
+                token_num = output.token_ids
+            if reschedule_point > 0 and token_num >= reschedule_point:
+                raise asyncio.CancelledError
             if async_mode:
                 if request_id in self.replay_buffer:
                     if 'token_ids' in self.replay_buffer[request_id]:
@@ -347,7 +352,8 @@ class AsyncvLLMServer(AsyncServerBase):
             if request_id in self.output_buffer:
                 del self.output_buffer[request_id]
 
-    def add_generation_task(self, raw_prompt, sampling_params, request_id, do_print=False, async_mode=False):
+    def add_generation_task(self, raw_prompt, sampling_params, request_id, do_print=False, async_mode=False,
+                            reschedule_point=-1):
         output_generator = self.engine.generate(
                                 prompt=raw_prompt,
                                 sampling_params=sampling_params,
@@ -358,12 +364,15 @@ class AsyncvLLMServer(AsyncServerBase):
                         output_generator=output_generator,
                         request_id=request_id,
                         do_print=do_print,
-                        async_mode=async_mode
+                        async_mode=async_mode,
+                        reschedule_point=reschedule_point,
                     )
                 )
         self.collect_tasks.append(task)
 
     def transfer_replay(self):
+        if len(self.replay_buffer) == 0:
+            return True
         request_ids = list(self.replay_buffer.keys())
         for request_id in request_ids:
             gen_output = self.replay_buffer[request_id]["gen_output"]
@@ -385,12 +394,28 @@ class AsyncvLLMServer(AsyncServerBase):
                 async_mode=True
             )
         return len(request_ids) > 0
+    
+    def set_replay_buffer(self, replay_buffer):
+        self.replay_buffer = replay_buffer
+
+    def get_and_reset_replay_buffer(self):
+        ret = {}
+        for uid in self.replay_buffer.keys():
+            ret[uid] = {
+                'replay_buffer': self.replay_buffer[uid],
+                'prompt_info': self.prompt_info[uid],
+            }
+        self.replay_buffer = {}
+        return ret
 
     async def generate_sequences_async(self, prompts, **kwargs):
         if 'uid' in prompts.non_tensor_batch.keys():
             uids = prompts.non_tensor_batch['uid']
         else:
             raise ValueError("Uids of prompts is needed in generate_sequences_async")
+        reschedule_point = -1
+        if 'reschedule_point' in prompts.meta_info:
+            reschedule_point = prompts.meta_info['reschedule_point']
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
@@ -420,7 +445,7 @@ class AsyncvLLMServer(AsyncServerBase):
                 if batch_index < 1:
                     print(f"conversation: {raw_prompt}")
                 request_id = uids[batch_index]
-                if prompts.meta_info['partial_rollout_enable']:
+                if prompts.meta_info['partial_rollout_enable'] or reschedule_point > 0:
                     assert self.config.rollout.n == 1, f"when using partial rollout in async rollout, \
                                                     n must be equal to 1"
                     self.replay_buffer[request_id] = {
@@ -433,9 +458,21 @@ class AsyncvLLMServer(AsyncServerBase):
                     sampling_params=SamplingParams(**self.sampling_params),
                     request_id=request_id,
                     # do_print=(batch_index < 1)
-                    async_mode=True
+                    async_mode=True,
+                    reschedule_point=reschedule_point,
                 )
                 self.prompt_info[request_id] = prompts[batch_index]
+
+    async def _reschedule_output(self, batch_size: int):
+        _begin_time = time.time()
+        
+        tasks = set(self.collect_tasks)
+        while tasks:
+            done, tasks = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+        
 
     async def collect_outputs_async(self, batch_size: int):
         _begin_time = time.time()
@@ -565,6 +602,9 @@ class AsyncvLLMServer(AsyncServerBase):
                 "temperature": self.config.rollout.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
+        
+        if reschedule_point > 0:
+            kwargs["max_tokens"] = reschedule_point
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
