@@ -1300,7 +1300,6 @@ class RayPPOTrainer:
                                 ray.get(history_rollout_trees_actor.delete.remote(prompt_id)) # clear the tree every epoch
                                 ray.get(history_rollout_trees_actor.add_tree.remote(prompt_id))
                                 ray.get(history_rollout_trees_actor.tree_append_node.remote(prompt_id, response.numpy().tolist(), token_level_scores.sum().item()))
-                                ray.get(history_rollout_trees_actor.set.remote(prompt_id, new_tree))
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
