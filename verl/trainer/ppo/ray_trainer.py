@@ -1299,8 +1299,8 @@ class RayPPOTrainer:
                                 history_rollout_trees_actor = get_history_trees()
                                 new_tree = RewardAwareSuffixTree()
                                 new_tree.add_node(response.numpy().tolist(), token_level_scores.sum().item())
-                                history_rollout_trees_actor.delete.remote(prompt_id) # clear the tree every epoch
-                                history_rollout_trees_actor.set.remote(prompt_id, new_tree)
+                                ray.get(history_rollout_trees_actor.delete.remote(prompt_id)) # clear the tree every epoch
+                                ray.get(history_rollout_trees_actor.set.remote(prompt_id, new_tree))
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
