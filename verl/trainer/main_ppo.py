@@ -75,8 +75,8 @@ def run_ppo(config) -> None:
         
     if config.actor_rollout_ref.rollout.use_history_spec_decode:
         from vllm.v1.spec_decode.global_module.suffix_tree import \
-            initialize_global_history_trees
-        initialize_global_history_trees()
+            GlobalRewardAwareSuffixTreeGroup
+        global_history_trees_actor = GlobalRewardAwareSuffixTreeGroup.options(name="global_trees_service").remote()
 
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
