@@ -18,8 +18,8 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 import os
 
 import hydra
-import torch
 import ray
+import torch
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
@@ -72,6 +72,11 @@ def run_ppo(config) -> None:
             runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}},
             num_cpus=config.ray_init.num_cpus,
         )
+        
+    if config.actor_rollout_ref.rollout.use_history_spec_decode:
+        from vllm.v1.spec_decode.global_module.suffix_tree import \
+            initialize_global_history_trees
+        initialize_global_history_trees()
 
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
@@ -104,15 +109,19 @@ class TaskRunner:
         if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
             assert config.critic.strategy in ["fsdp", "fsdp2"]
             from verl.single_controller.ray import RayWorkerGroup
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+            from verl.workers.fsdp_workers import (ActorRolloutRefWorker,
+                                                   AsyncActorRolloutRefWorker,
+                                                   CriticWorker)
 
             actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-            from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
-            from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
+            from verl.single_controller.ray.megatron import \
+                NVMegatronRayWorkerGroup
+            from verl.workers.megatron_workers import (ActorRolloutRefWorker,
+                                                       CriticWorker)
 
             actor_rollout_cls = ActorRolloutRefWorker
             ray_worker_group_cls = NVMegatronRayWorkerGroup
