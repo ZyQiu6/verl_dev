@@ -46,4 +46,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.fuse_enable=False \
     trainer.fuse_value=True \
     trainer.fuse_old_log_prob=True \
-    trainer.total_epochs=15 $@ >> olmoe-output.txt
+    trainer.total_epochs=15 $@ >> olmoe-output_ep.txt

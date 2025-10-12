@@ -405,6 +405,7 @@ class ActorRolloutRefWorker(Worker):
         print(f"rollout_device_mesh={rollout_device_mesh}")
         self.rollout_device_mesh = rollout_device_mesh
         rollout_name = self.config.rollout.name
+        print(f"rollout_name={rollout_name}")
         if rollout_name == "hf":
             from verl.workers.rollout import HFRollout
             from verl.workers.sharding_manager.base import BaseShardingManager

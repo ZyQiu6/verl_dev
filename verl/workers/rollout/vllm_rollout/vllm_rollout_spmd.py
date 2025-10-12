@@ -160,6 +160,7 @@ class vLLMRollout(BaseRollout):
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
             speculative_config=speculative_config,
+            enable_expert_parallel=config.get("enable_expert_parallel", False),
         )
 
         # Offload vllm model to reduce peak memory usage

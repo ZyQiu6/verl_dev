@@ -12,8 +12,9 @@ export HF_ENDPOINT=https://hf-mirror.com
 # actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
 
 python3 -m verl.trainer.main_ppo \
-    data.train_files=../data/gsm8k/train.parquet \
-    data.val_files=../data/gsm8k//test.parquet \
+    actor_rollout_ref.rollout.name=sglang \
+    data.train_files=/home/weijia/verl_dev/data/gsm8k/train.parquet \
+    data.val_files=/home/weijia/verl_dev/data/gsm8k//test.parquet \
     data.train_batch_size=128 \
     data.val_batch_size=512 \
     data.max_prompt_length=256 \
@@ -30,8 +31,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
-    +actor_rollout_ref.rollout.enable_expert_parallel=True\
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
     critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
@@ -47,7 +47,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
     trainer.test_freq=5 \
-    trainer.fuse_enable=False \
-    trainer.fuse_value=True \
-    trainer.fuse_old_log_prob=True \
-    trainer.total_epochs=2 $@ >> olmoe-output_dpep.txt
+    trainer.total_epochs=2 $@ >> olmoe-output_sglang.txt
