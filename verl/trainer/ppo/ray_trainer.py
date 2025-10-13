@@ -1286,9 +1286,11 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
                         
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        ray_history_spec_tasks = []
                         from vllm.v1.spec_decode.global_module.suffix_tree import \
                             get_history_trees
                         with _timer("update_rollout_suffix_tree", timing_raw):
+                            history_rollout_trees_actor = get_history_trees()
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
                                 
@@ -1296,10 +1298,10 @@ class RayPPOTrainer:
                                 response = batch_item.batch["responses"]
                                 prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
-                                history_rollout_trees_actor = get_history_trees()
-                                ray.get(history_rollout_trees_actor.delete.remote(prompt_id)) # clear the tree every epoch
-                                ray.get(history_rollout_trees_actor.add_tree.remote(prompt_id))
-                                ray.get(history_rollout_trees_actor.tree_append_node.remote(prompt_id, response.numpy().tolist(), token_level_scores.sum().item()))
+                                ray_history_spec_tasks.append(history_rollout_trees_actor.delete.remote(prompt_id)) # clear the tree every epoch
+                                ray_history_spec_tasks.append(history_rollout_trees_actor.add_tree.remote(prompt_id))
+                                ray_history_spec_tasks.append(history_rollout_trees_actor.tree_append_node.remote(
+                                    prompt_id, response.numpy().tolist(), token_level_scores.sum().item()))
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -1311,6 +1313,9 @@ class RayPPOTrainer:
                                 self.actor_rollout_wg.sync_fuse_actor_model_weights()
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        
+                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        ray.get(ray_history_spec_tasks)
 
                     batch = unpad_dataproto(batch, pad_size=pad_size)
 
