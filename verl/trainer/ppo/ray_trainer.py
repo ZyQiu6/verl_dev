@@ -34,6 +34,7 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
+import time
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
@@ -971,6 +972,7 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        begin_timestamp = time.time()
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1226,6 +1228,7 @@ class RayPPOTrainer:
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
+                    pprint(f"TOTAL TIME: {time.time()-begin_timestamp:.4f} s")
                     progress_bar.close()
                     return
 
