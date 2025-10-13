@@ -1,0 +1,12 @@
+0.5.0 verl +sglang环境
+1.正常安装verl0.5.0标准环境。
+conda create -n verl python==3.10
+conda activate verl
+git clone https://github.com/volcengine/verl.git
+cd verl
+pip install --no-deps -e .
+2.sglang:
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple uv
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple sglang[all]==0.5.2
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements_sglang.txt
+conda install -c nvidia cuda-toolkit=12.6 #需要指定环境变量,详见run_moe_ppo_onpolicy_sglang.sh脚本
