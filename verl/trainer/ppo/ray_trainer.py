@@ -1290,7 +1290,7 @@ class RayPPOTrainer:
                         from vllm.v1.spec_decode.global_module.suffix_tree import \
                             get_history_trees
                         with _timer("update_rollout_suffix_tree", timing_raw):
-                            history_rollout_trees_actor = get_history_trees()
+                            history_rollout_trees = get_history_trees()
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
                                 
@@ -1298,9 +1298,9 @@ class RayPPOTrainer:
                                 response = batch_item.batch["responses"]
                                 prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
-                                ray_history_spec_tasks.append(history_rollout_trees_actor.delete.remote(prompt_id)) # clear the tree every epoch
-                                ray_history_spec_tasks.append(history_rollout_trees_actor.add_tree.remote(prompt_id))
-                                ray_history_spec_tasks.append(history_rollout_trees_actor.tree_append_node.remote(
+                                ray_history_spec_tasks.append(history_rollout_trees.delete(prompt_id)) # clear the tree every epoch
+                                ray_history_spec_tasks.append(history_rollout_trees.add_tree(prompt_id))
+                                ray_history_spec_tasks.append(history_rollout_trees.tree_append_node(
                                     prompt_id, response.numpy().tolist(), token_level_scores.sum().item()))
 
                     # implement critic warmup
