@@ -38,8 +38,8 @@ if [ -f "$CUDA_HOME/lib/libcudart.so.12" ] && [ ! -e "$CUDA_HOME/lib64/libcudart
   ln -sf ../lib/libcudart.so.12 "$CUDA_HOME/lib64/libcudart.so.12"
 fi
 
-#actor_rollout_ref.model.path=allenai/OLMoE-1B-7B-0924-Instruct\
-#+actor_rollout_ref.rollout.disable_cuda_graph=true\
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 ### ---- 启动训练 ----
 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=sglang \
@@ -49,33 +49,39 @@ python3 -m verl.trainer.main_ppo \
     data.val_batch_size=512 \
     data.max_prompt_length=256 \
     data.max_response_length=1024 \
-    actor_rollout_ref.model.path=allenai/OLMoE-1B-7B-0924-Instruct\
+    actor_rollout_ref.model.path=deepseek-ai/DeepSeek-V2-Lite-Chat\
+    +actor_rollout_ref.rollout.disable_cuda_graph=true\
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.2\
     actor_rollout_ref.rollout.free_cache_engine=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.rollout.enforce_eager=True \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=4\
+    actor_rollout_ref.rollout.expert_parallel_size=4\
+    actor_rollout_ref.rollout.data_parallel_size=1\
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
     critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
     critic.model.enable_gradient_checkpointing=True \
-    critic.ppo_micro_batch_size_per_gpu=4 \
+    critic.ppo_micro_batch_size_per_gpu=1 \
     critic.model.fsdp_config.param_offload=True \
+    critic.model.fsdp_config.optimizer_offload=True \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
-    trainer.project_name='verl_gsm8k_olmoechat_dpep' \
+    trainer.project_name='verl_gsm8k_dsv2chat_dpep' \
     trainer.experiment_name='original' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
     trainer.test_freq=5 \
     trainer.total_epochs=1 "$@" \
-    >> olmoe-output_sglang2dp2tp.txt
+    >> olmoe-output_sglang_dsv2_2dp2tp.txt

@@ -1001,6 +1001,10 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        #change parallism method
+                        if self.global_steps == 1:
+                            change_parallism_method = True
+                            gen_batch.meta_info["change_parallism_method"] = change_parallism_method
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:

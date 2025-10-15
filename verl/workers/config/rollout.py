@@ -122,6 +122,8 @@ class RolloutConfig(BaseConfig):
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2
     max_num_batched_tokens: int = 8192
+    disable_cuda_graph: Optional[bool] = False  # 新增
+
 
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)

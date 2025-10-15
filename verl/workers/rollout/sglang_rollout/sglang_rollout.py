@@ -464,6 +464,9 @@ class SGLangRollout(BaseRollout):
                 # In async mode, we want token in token out.
                 "skip_tokenizer_init": self.config.skip_tokenizer_init,
                 "dist_timeout": 1800,
+                "disable_cuda_graph": self.config.disable_cuda_graph,
+                "ep_size": self.config.expert_parallel_size,
+                "dp_size": self.config.data_parallel_size,
             }
 
             if is_server_mode:

@@ -25,7 +25,6 @@ When working with Megatron:
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
-
 import asyncio
 import getpass
 import inspect
@@ -69,6 +68,7 @@ from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
+
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -207,6 +207,8 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
+            enable_expert_parallel=config.expert_parallel_size > 1,
+            data_parallel_size=config.data_parallel_size,
             seed=config.get("seed", 0),
             **compilation_config,
             **self.lora_kwargs,
@@ -271,6 +273,65 @@ class vLLMRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        #change parallism method
+        change = prompts.meta_info.pop("change_parallism_method", None)
+        if change:
+            #rebuild generation model
+            # 1) 阻塞式屏障（可选）：避免与其他并发请求交错
+            try:
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+            except Exception:
+                pass
+             # 2) 优雅关闭旧引擎（AsyncLLMEngine 需要 shutdown；LLM 直接释放即可）
+            try:
+                if hasattr(self, "inference_engine") and self.inference_engine is not None:
+                    if hasattr(self.inference_engine, "shutdown"):
+                        # vLLM 异步引擎需要显式 shutdown 释放后台循环/显存
+                        self.inference_engine.shutdown()   # 参考官方 API
+                    # 释放对象引用
+                    del self.inference_engine
+            finally:
+                # 清理显存
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            # 3) 组装新的引擎，最简单实现直接给出配置,TP
+            self.inference_engine = LLM(
+                model=self.config.model_path,
+                tokenizer=self.tokenizer,
+                tokenizer_mode=self.config.tokenizer_mode,
+                trust_remote_code=self.trust_remote_code,
+                dtype=self.config.dtype,
+                tensor_parallel_size=4,
+                max_num_batched_tokens=self.max_num_batched_tokens,
+                enable_chunked_prefill=self.config.enable_chunked_prefill,
+                enable_prefix_caching=self.config.enable_prefix_caching,
+                data_parallel_size=1,
+                seed=self.config.get("seed", 0),
+                **engine_kwargs,
+            )
+            # 4) 通过 ShardingManager 同步“最新权重”
+            try:
+                sm = getattr(self, "rollout_sharding_manager", None)
+                if sm is not None:
+                    # 进入上下文通常会完成从 Actor → Rollout 的一次权重材质化与布局转换
+                    with sm:
+                        pass
+            except Exception as e:
+                # 不影响后续生成；必要时在这里加你的告警/日志
+                print(f"[warn] weight sync via ShardingManager failed: {e}")
+            
+            print("successfully change vllm parallism method")
+
+            # 5) （可选）再次屏障，确保所有 rank 都完成了重构
+            try:
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+            except Exception:
+                pass
+
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         # left-padded attention_mask
         attention_mask = prompts.batch["attention_mask"]
