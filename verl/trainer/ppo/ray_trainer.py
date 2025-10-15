@@ -942,12 +942,7 @@ class RayPPOTrainer:
         begin_timestamp = time.time()
         self.training_datas = [batch_dict for batch_dict in self.train_dataloader]
         for epoch in range(self.config.trainer.total_epochs):
-            i = 0
             for batch_dict in self.training_datas:
-                if i < 2:
-                    i += 1
-                else:
-                    continue
                 metrics = {}
                 timing_raw = {}
                 total_ops = 0
