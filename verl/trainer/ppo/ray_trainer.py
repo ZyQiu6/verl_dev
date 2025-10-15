@@ -1291,6 +1291,7 @@ class RayPPOTrainer:
                             get_history_trees
                         with _timer("update_rollout_suffix_tree", timing_raw):
                             history_rollout_trees = get_history_trees()
+                            metrics.update(history_rollout_trees.compute_metrics())
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
                                 
