@@ -92,6 +92,41 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> list[in
 if is_version_ge(pkg="vllm", minver="0.7.3"):
     VLLMHijack.hijack()
 
+def _merge_engine_kwargs(model_path, tensor_parallel_size,
+                         config, max_model_len, load_format,
+                         max_num_batched_tokens, trust_remote_code,
+                         compilation_config, lora_kwargs, engine_kwargs):
+    """把初始化时用到的所有参数合成一个 dict 并返回。"""
+    base = {
+        "model": model_path,
+        "enable_sleep_mode": config.free_cache_engine,
+        "tensor_parallel_size": int(tensor_parallel_size),
+        "distributed_executor_backend": "external_launcher",
+        "dtype": config.dtype,
+        "enforce_eager": config.enforce_eager,
+        "gpu_memory_utilization": config.gpu_memory_utilization,
+        "disable_custom_all_reduce": True,
+        "skip_tokenizer_init": False,
+        "max_model_len": max_model_len,
+        "max_num_seqs": config.max_num_seqs,
+        "load_format": load_format,
+        "disable_log_stats": config.disable_log_stats,
+        "max_num_batched_tokens": max_num_batched_tokens,
+        "enable_chunked_prefill": config.enable_chunked_prefill,
+        "enable_prefix_caching": config.enable_prefix_caching,
+        "trust_remote_code": trust_remote_code,
+        "enable_expert_parallel": config.expert_parallel_size > 1,
+        "data_parallel_size": getattr(config, "data_parallel_size", None),
+        "seed": config.get("seed", 0),
+    }
+    # 合并可选的额外参数（后合并的可覆盖前面的同名键）
+    base.update(compilation_config or {})
+    base.update(lora_kwargs or {})
+    base.update(engine_kwargs or {})
+
+    # 清理 None 值，避免把“未设置”的参数硬塞给 LLM
+    base = {k: v for k, v in base.items() if v is not None}
+    return base
 
 class vLLMRollout(BaseRollout):
     def __init__(
@@ -214,7 +249,7 @@ class vLLMRollout(BaseRollout):
             **self.lora_kwargs,
             **engine_kwargs,
         )
-
+        self._engine_kwargs = _merge_engine_kwargs(model_path, tensor_parallel_size, config, max_model_len, load_format,max_num_batched_tokens, trust_remote_code,compilation_config, self.lora_kwargs, engine_kwargs,)
         kwargs = dict(
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
@@ -298,20 +333,11 @@ class vLLMRollout(BaseRollout):
                 except Exception:
                     pass
             # 3) 组装新的引擎，最简单实现直接给出配置,TP
-            self.inference_engine = LLM(
-                model=self.config.model_path,
-                tokenizer=self.tokenizer,
-                tokenizer_mode=self.config.tokenizer_mode,
-                trust_remote_code=self.trust_remote_code,
-                dtype=self.config.dtype,
-                tensor_parallel_size=4,
-                max_num_batched_tokens=self.max_num_batched_tokens,
-                enable_chunked_prefill=self.config.enable_chunked_prefill,
-                enable_prefix_caching=self.config.enable_prefix_caching,
-                data_parallel_size=1,
-                seed=self.config.get("seed", 0),
-                **engine_kwargs,
-            )
+            new_kwargs = copy.deepcopy(self._engine_kwargs)
+            new_kwargs["tensor_parallel_size"] = 4
+            new_kwargs["expert_parallel_size"] = False
+            new_kwargs["data_parallel_size"] = 1
+            self.inference_engine = LLM(**self._engine_kwargs)
             # 4) 通过 ShardingManager 同步“最新权重”
             try:
                 sm = getattr(self, "rollout_sharding_manager", None)
