@@ -944,7 +944,7 @@ class RayPPOTrainer:
         for epoch in range(self.config.trainer.total_epochs):
             i = 0
             for batch_dict in self.training_datas:
-                if i < 3:
+                if i < 2:
                     i = i + 1
                 else:
                     continue
