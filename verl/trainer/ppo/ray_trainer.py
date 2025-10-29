@@ -60,6 +60,10 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+#新增开始
+from vllm.utils.moe_stats import moe_stats
+import json
+#新增结束
 
 
 @dataclass
@@ -996,15 +1000,16 @@ class RayPPOTrainer:
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-
-                is_last_step = self.global_steps >= self.total_training_steps
+                #is_last_step = self.global_steps >= self.total_training_steps
+                #仅仅执行5步
+                is_last_step = self.global_steps >= 2
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         #change parallism method
-                        if self.global_steps == 1:
-                            change_parallism_method = True
-                            gen_batch.meta_info["change_parallism_method"] = change_parallism_method
+                        # if self.global_steps == 1:
+                        #     change_parallism_method = True
+                        #     gen_batch.meta_info["change_parallism_method"] = change_parallism_method
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
@@ -1234,6 +1239,10 @@ class RayPPOTrainer:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     pprint(f"TOTAL TIME: {time.time()-begin_timestamp:.4f} s")
                     progress_bar.close()
+                    epoch_stats = moe_stats.snapshot()  # 得到 {prompt_id: {layer_idx: [per-expert prob sums]}}
+                    with open(f"moe_epoch_{epoch}.json", "w") as f:
+                        json.dump(epoch_stats, f)
+                    moe_stats.reset_epoch()  # 清空计数，进入下一轮
                     return
 
                 # this is experimental and may be changed/removed in the future
@@ -1241,3 +1250,8 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+            # ... 一轮生成/训练（该轮内统计已自动累计）...
+            epoch_stats = moe_stats.snapshot()  # 得到 {prompt_id: {layer_idx: [per-expert prob sums]}}
+            with open(f"moe_epoch_{epoch}.json", "w") as f:
+                json.dump(epoch_stats, f)
+            moe_stats.reset_epoch()  # 清空计数，进入下一轮

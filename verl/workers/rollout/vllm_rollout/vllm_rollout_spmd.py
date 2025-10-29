@@ -68,6 +68,8 @@ from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
+#new wj import
+import copy
 
 
 logger = logging.getLogger(__file__)
@@ -115,8 +117,8 @@ def _merge_engine_kwargs(model_path, tensor_parallel_size,
         "enable_chunked_prefill": config.enable_chunked_prefill,
         "enable_prefix_caching": config.enable_prefix_caching,
         "trust_remote_code": trust_remote_code,
-        "enable_expert_parallel": config.expert_parallel_size > 1,
-        "data_parallel_size": getattr(config, "data_parallel_size", None),
+        "enable_expert_parallel": config.enable_expert_parallel,
+        "data_parallel_size": config.data_parallel_size,
         "seed": config.get("seed", 0),
     }
     # 合并可选的额外参数（后合并的可覆盖前面的同名键）
@@ -224,6 +226,10 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
+        print("max_model_len:", max_model_len, "max_num_batched_tokens:", max_num_batched_tokens)
+        print("compilation_config:", compilation_config)
+        # max_num_seqs=config.max_num_seqs,
+        # max_num_batched_tokens=max_num_batched_tokens,
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -242,7 +248,7 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
-            enable_expert_parallel=config.expert_parallel_size > 1,
+            enable_expert_parallel=config.enable_expert_parallel,
             data_parallel_size=config.data_parallel_size,
             seed=config.get("seed", 0),
             **compilation_config,
@@ -285,6 +291,39 @@ class vLLMRollout(BaseRollout):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
 
+    def _hard_reset_vllm(self):
+        # 1) 停旧引擎
+        if getattr(self, "inference_engine", None) is not None:
+            try:
+                # 新版本引擎：有 llm_engine，可调用 shutdown()
+                if hasattr(self.inference_engine, "llm_engine"):
+                    try:
+                        self.inference_engine.llm_engine.shutdown()
+                    except Exception:
+                        pass
+            finally:
+                self.inference_engine = None
+
+        # 2) 销毁 vLLM 的并行/通信环境（关键！）
+        try:
+            from vllm.distributed.parallel_state import (
+                destroy_model_parallel, destroy_distributed_environment
+            )
+            destroy_model_parallel()
+            #destroy_distributed_environment()
+        except Exception as e:
+            print(f"[warn] destroy parallel_state failed: {e}")
+
+        # 3) 等待、清显存
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    def _pin_cuda_device_before_llm(self) -> None:
+        # 任何分布式/PG/LLM重构之前都要先绑卡
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        _ = torch.empty(1, device="cuda")  # 让 NCCL/PG 看到当前 device
+
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
@@ -311,6 +350,7 @@ class vLLMRollout(BaseRollout):
         #change parallism method
         change = prompts.meta_info.pop("change_parallism_method", None)
         if change:
+            begin = time.time()
             #rebuild generation model
             # 1) 阻塞式屏障（可选）：避免与其他并发请求交错
             try:
@@ -318,7 +358,7 @@ class vLLMRollout(BaseRollout):
                     torch.distributed.barrier()
             except Exception:
                 pass
-             # 2) 优雅关闭旧引擎（AsyncLLMEngine 需要 shutdown；LLM 直接释放即可）
+             # 2) 关闭旧引擎（AsyncLLMEngine 需要 shutdown；LLM 直接释放即可）
             try:
                 if hasattr(self, "inference_engine") and self.inference_engine is not None:
                     if hasattr(self.inference_engine, "shutdown"):
@@ -335,9 +375,11 @@ class vLLMRollout(BaseRollout):
             # 3) 组装新的引擎，最简单实现直接给出配置,TP
             new_kwargs = copy.deepcopy(self._engine_kwargs)
             new_kwargs["tensor_parallel_size"] = 4
-            new_kwargs["expert_parallel_size"] = False
+            new_kwargs["enable_expert_parallel"] = False
             new_kwargs["data_parallel_size"] = 1
-            self.inference_engine = LLM(**self._engine_kwargs)
+            self._hard_reset_vllm()
+            print("distributed environment is initialized?",torch.distributed.is_initialized())
+            self.inference_engine = LLM(**new_kwargs)
             # 4) 通过 ShardingManager 同步“最新权重”
             try:
                 sm = getattr(self, "rollout_sharding_manager", None)
@@ -348,8 +390,7 @@ class vLLMRollout(BaseRollout):
             except Exception as e:
                 # 不影响后续生成；必要时在这里加你的告警/日志
                 print(f"[warn] weight sync via ShardingManager failed: {e}")
-            
-            print("successfully change vllm parallism method")
+            print("successfully change vllm parallism methed")
 
             # 5) （可选）再次屏障，确保所有 rank 都完成了重构
             try:
@@ -357,6 +398,8 @@ class vLLMRollout(BaseRollout):
                     torch.distributed.barrier()
             except Exception:
                 pass
+            end = time.time()
+            print(f"time for change vllm parallism method: {end-begin} s")
 
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         # left-padded attention_mask

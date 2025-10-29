@@ -1,0 +1,46 @@
+#!/bin/sh
+
+export HYDRA_FULL_ERROR=1
+export VLLM_USE_V1=1
+export RAY_DEDUP_LOGS=0
+export RAY_TMPDIR=/data/qiuzy/tmp
+export HF_ENDPOINT=https://hf-mirror.com
+export CUDA_VISIBLE_DEVICES='0,4'
+
+python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
+    data.train_files=/home/weijia/verl_dev/data/gsm8k/train.parquet \
+    data.val_files=/home/weijia/verl_dev/data/gsm8k//test.parquet \
+    data.train_batch_size=256 \
+    data.val_batch_size=1312 \
+    data.max_prompt_length=256 \
+    data.max_response_length=4096 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.model.path=/home/weijia/.cache/modelscope/hub/models/Qwen/Qwen2.5-1.5B-Instruct\
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.free_cache_engine=False \
+    actor_rollout_ref.rollout.n=4 \
+    actor_rollout_ref.rollout.temperature=0.01 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=20480 \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    trainer.critic_warmup=0 \
+    trainer.logger=['console'] \
+    trainer.project_name='verl_gsm8k_0.5B_256' \
+    trainer.experiment_name='original' \
+    trainer.n_gpus_per_node=2 \
+    trainer.nnodes=1 \
+    +trainer.rollout_data_dir=./dump \
+    +trainer.rollout_length_dir=./dump \
+    trainer.save_freq=1000 \
+    trainer.test_freq=10 \
+    trainer.total_epochs=15 $@ >> 1.5boutput.txt

@@ -122,8 +122,10 @@ class RolloutConfig(BaseConfig):
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2
     max_num_batched_tokens: int = 8192
+    #max_num_batched_tokens: int = 128
     disable_cuda_graph: Optional[bool] = False  # 新增
-
+    enable_expert_parallel: bool = False
+    all2all_backend: Optional[str] = None  # 新增
 
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
@@ -131,8 +133,8 @@ class RolloutConfig(BaseConfig):
     val_kwargs: SamplingConfig = field(default_factory=SamplingConfig)
 
     max_model_len: Optional[int] = None
+    #max_num_seqs: int = 16
     max_num_seqs: int = 1024
-
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size: Optional[int] = None
     log_prob_micro_batch_size_per_gpu: Optional[int] = None
