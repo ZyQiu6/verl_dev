@@ -135,8 +135,21 @@ class RLHFDataset(Dataset):
             dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
-
         print(f"dataset len: {len(self.dataframe)}")
+                # 添加采样逻辑，只使用部分数据
+        dataset_fraction = self.config.get("dataset_fraction", 1.0)  # 默认使用全部数据
+        if dataset_fraction < 1.0:
+            sample_size = int(len(self.dataframe) * dataset_fraction)
+            # 创建随机索引
+            import random
+            indices = list(range(len(self.dataframe)))
+            random.seed(self.config.get("seed", 42))  # 使用固定种子以确保可重复性
+            random.shuffle(indices)
+            # 只保留前sample_size个样本
+            selected_indices = indices[:sample_size]
+            self.dataframe = self.dataframe.select(selected_indices)
+            print(f"Sampled dataset len: {len(self.dataframe)} (fraction: {dataset_fraction})")
+
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 

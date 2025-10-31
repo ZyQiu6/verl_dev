@@ -110,3 +110,6 @@ datagen:
 
 # Additional kwargs when calling tokenizer.apply_chat_template
 apply_chat_template_kwargs: {}
+
+# Fraction of the dataset to use for training (between 0 and 1). Default is 1.0 (use all data).
+dataset_fraction: 1.0

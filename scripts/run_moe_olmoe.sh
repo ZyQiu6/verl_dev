@@ -4,10 +4,14 @@ export VLLM_USE_V1=1
 export RAY_DEDUP_LOGS=0
 export CUDA_VISIBLE_DEVICES=1,2
 export HF_ENDPOINT=https://hf-mirror.com
+export VLLM_ALL2ALL_BACKEND=deepep_low_latency
+export VLLM_MOE_STATS=1
+#export VLLM_MOE_DP_CHUNK_SIZE=128
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=/data/wj/verl_dev/data/gsm8k/train.parquet \
     data.val_files=/data/wj/verl_dev/data/gsm8k/test.parquet \
+    data.dataset_fraction=0.1 \
     data.train_batch_size=128 \
     data.val_batch_size=512 \
     data.max_prompt_length=256 \
@@ -43,4 +47,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
     trainer.test_freq=5 \
-    trainer.total_epochs=2 $@ >> olmoe-record.txt
+    trainer.total_epochs=10 $@ >> olmoe-record.txt

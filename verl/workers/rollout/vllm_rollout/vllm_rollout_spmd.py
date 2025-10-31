@@ -70,7 +70,7 @@ from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 #new wj import
 import copy
-
+from vllm.utils.moe_stats import moe_stats
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -535,6 +535,10 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+        
+        #after one batch, show record
+        print("MoE Stats in vllm")
+        moe_stats.snapshot()
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
@@ -585,6 +589,12 @@ class vLLMRollout(BaseRollout):
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
             model.load_weights(weights)
+        ###new wj
+    def get_record(self):
+        return moe_stats.snapshot()
+    
+    def flush_record(self):
+        return moe_stats.reset_epoch()
 
 
 # https://github.com/vllm-project/vllm/issues/13175
@@ -747,3 +757,4 @@ class vLLMAsyncRollout(BaseRollout):
 
     def get_zeromq_address(self):
         return self.address
+    

@@ -1107,6 +1107,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             except Exception:
                 # silently ignore if profiler doesn't support memory snapshots
                 pass
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_record(self):
+        """Get MoE statistics record from rollout."""
+        if hasattr(self, 'rollout') and hasattr(self.rollout, 'get_record'):
+            return self.rollout.get_record()
+        return {}
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def flush_record(self):
+        return self.rollout.flush_record()
 
 
 class CriticWorker(Worker, DistProfilerExtension):
