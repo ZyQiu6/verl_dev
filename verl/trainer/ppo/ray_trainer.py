@@ -940,14 +940,13 @@ class RayPPOTrainer:
         last_val_metrics = None
 
         begin_timestamp = time.time()
-        self.training_datas = [batch_dict for batch_dict in self.train_dataloader]
+        self.training_datas = [deepcopy(batch_dict) for batch_dict in self.train_dataloader]
         for epoch in range(self.config.trainer.total_epochs):
-            i = 0
-            for batch_dict in self.training_datas:
-                if i < 2:
-                    i = i + 1
-                else:
-                    continue
+            for i in range(len(self.training_datas)):
+                if i >= 5:
+                    break
+                batch_dict = self.training_datas[i]
+                
                 metrics = {}
                 timing_raw = {}
                 total_ops = 0
@@ -1291,15 +1290,14 @@ class RayPPOTrainer:
                             get_history_trees
                         with _timer("update_rollout_suffix_tree", timing_raw):
                             history_rollout_trees = get_history_trees()
+                            ray_history_spec_tasks.append(history_rollout_trees.clear()) # clear the tree every epoch
                             metrics.update(history_rollout_trees.compute_metrics())
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
-                                
                                 token_level_scores = batch_item.batch["token_level_scores"]
                                 response = batch_item.batch["responses"]
                                 prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
-                                ray_history_spec_tasks.append(history_rollout_trees.delete(prompt_id)) # clear the tree every epoch
                                 ray_history_spec_tasks.append(history_rollout_trees.add_tree(prompt_id))
                                 ray_history_spec_tasks.append(history_rollout_trees.tree_append_node(
                                     prompt_id, response.numpy().tolist(), token_level_scores.sum().item()))
