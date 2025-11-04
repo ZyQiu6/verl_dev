@@ -940,13 +940,14 @@ class RayPPOTrainer:
         last_val_metrics = None
 
         begin_timestamp = time.time()
-        self.training_datas = [deepcopy(batch_dict) for batch_dict in self.train_dataloader]
+        self.training_datas = [batch_dict for batch_dict in self.train_dataloader]
         for epoch in range(self.config.trainer.total_epochs):
-            for i in range(len(self.training_datas)):
-                if i >= 5:
-                    break
-                batch_dict = self.training_datas[i]
-                
+            i = 0
+            for batch_dict in self.training_datas:
+                if i < 2:
+                    i = i + 1
+                else:
+                    continue
                 metrics = {}
                 timing_raw = {}
                 total_ops = 0
@@ -1285,28 +1286,23 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
                         
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
-                        history_spec_tasks = []
+                        ray_history_spec_tasks = []
                         from vllm.v1.spec_decode.global_module.suffix_tree import \
                             get_history_trees
                         with _timer("update_rollout_suffix_tree", timing_raw):
                             history_rollout_trees = get_history_trees()
-                            history_spec_tasks.append(history_rollout_trees.delete(prompt_id)) # clear the tree every epoch
                             metrics.update(history_rollout_trees.compute_metrics())
                             for i in range(len(batch)):
-                                batch_item = batch[i]  # 取出batch的一个条目
+                                batch_item = batch[i]  # DataProtoItem
                                 
-                                response = batch_item.batch["responses"] # 获取该数据条目的生成响应（一个张量，包含生成的 token ID 序列，将被保存到历史树中）
-                                token_level_scores = batch_item.batch["token_level_scores"] # 获取该数据条目的 token 级别奖励分数（和response对应的张量，包含每个生成 token 的奖励分数）
-                                prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"] # 获取该数据条目的提示词 token ID 列表，用于生成唯一的 prompt_id
-                                prompt_id = str(hash(tuple(prompt_token_ids))) # 每个prompt唯一的 prompt_id
-                                history_spec_tasks.append(history_rollout_trees.add_tree(prompt_id))
-                                history_spec_tasks.append(history_rollout_trees.tree_append_node(
+                                token_level_scores = batch_item.batch["token_level_scores"]
+                                response = batch_item.batch["responses"]
+                                prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
+                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                ray_history_spec_tasks.append(history_rollout_trees.delete(prompt_id)) # clear the tree every epoch
+                                ray_history_spec_tasks.append(history_rollout_trees.add_tree(prompt_id))
+                                ray_history_spec_tasks.append(history_rollout_trees.tree_append_node(
                                     prompt_id, response.numpy().tolist(), token_level_scores.sum().item()))
-                                # response.numpy().tolist() 将张量转换为 Python 列表
-                                # # token_level_scores.sum().item() 计算序列的总奖励分数
-                                # history_rollout_trees.tree_append_node() 提交将当前生成序列添加到历史树的任务
-                                history_rollout_trees.dict[prompt_id].tree_ray_handle = ray.put(history_rollout_trees.dict[prompt_id].tree) # 进行ray.put
-                                
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -1318,6 +1314,9 @@ class RayPPOTrainer:
                                 self.actor_rollout_wg.sync_fuse_actor_model_weights()
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        
+                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        ray.get(ray_history_spec_tasks)
 
                     batch = unpad_dataproto(batch, pad_size=pad_size)
 
