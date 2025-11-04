@@ -1290,7 +1290,7 @@ class RayPPOTrainer:
                             get_history_trees
                         with _timer("update_rollout_suffix_tree", timing_raw):
                             history_rollout_trees = get_history_trees()
-                            history_spec_tasks.append(history_rollout_trees.delete(prompt_id)) # clear the tree every epoch
+                            history_spec_tasks.append(history_rollout_trees.clear()) # clear the tree every epoch
                             metrics.update(history_rollout_trees.compute_metrics())
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # 取出batch的一个条目
