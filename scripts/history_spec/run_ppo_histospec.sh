@@ -10,7 +10,7 @@
 export HYDRA_FULL_ERROR=1
 export VLLM_USE_V1=1
 export RAY_DEDUP_LOGS=0
-export RAY_TMPDIR=/data/qiuzy/tmp
+# export RAY_TMPDIR=/data/qiuzy/tmp
 export CUDA_VISIBLE_DEVICES='2,3'
 
 python3 -m verl.trainer.main_ppo \
@@ -53,7 +53,6 @@ python3 -m verl.trainer.main_ppo \
     +trainer.rollout_length_dir=/data/qiuzy/programs/verl_dev/dump \
     trainer.save_freq=1000 \
     trainer.test_freq=10 \
+    trainer.val_before_train=False \
     trainer.fuse_enable=False \
-    trainer.fuse_value=True \
-    trainer.fuse_old_log_prob=True \
     trainer.total_epochs=15 $@ >> output.txt

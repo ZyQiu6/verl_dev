@@ -949,8 +949,6 @@ class RayPPOTrainer:
                 
                 metrics = {}
                 timing_raw = {}
-                total_ops = 0
-                tmp_ops = 0
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
@@ -981,6 +979,12 @@ class RayPPOTrainer:
                 })
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                if self.config.actor_rollout_ref.rollout.use_history_spec_decode and self.global_steps == 1:
+                    from vllm.v1.spec_decode.global_module.suffix_tree import \
+                        get_history_trees
+                    self.history_rollout_trees = get_history_trees()
+                    self.history_rollout_trees.run_server()
+                    time.sleep(3.0)
 
                 with _timer("step", timing_raw):
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
@@ -992,12 +996,14 @@ class RayPPOTrainer:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             self.async_rollout_manager.wake_up()
-                            if reschedule_point > 0:
+                            if True:
                                 self.async_rollout_manager.self.async_rollout_manager.generate_sequences_async(gen_batch)
                                 gen_batch_output = self.async_rollout_manager.collect_outputs_async(self.config.data.train_batch_size)
                             else:
                                 gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
+                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        self.history_rollout_trees.stop_server()
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
@@ -1286,21 +1292,24 @@ class RayPPOTrainer:
                         
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
                         ray_history_spec_tasks = []
-                        from vllm.v1.spec_decode.global_module.suffix_tree import \
-                            get_history_trees
                         with _timer("update_rollout_suffix_tree", timing_raw):
-                            history_rollout_trees = get_history_trees()
-                            ray_history_spec_tasks.append(history_rollout_trees.clear()) # clear the tree every epoch
-                            metrics.update(history_rollout_trees.compute_metrics())
+                            metrics.update(self.history_rollout_trees.compute_metrics())
+                            for i in range(len(batch)):
+                                prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
+                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                ray_history_spec_tasks.append(self.history_rollout_trees.delete(prompt_id)) # clear the tree every epoch
+                                ray_history_spec_tasks.append(self.history_rollout_trees.add_tree(prompt_id))
+                            ray.get(ray_history_spec_tasks)
+                            ray_history_spec_tasks.clear()
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
                                 token_level_scores = batch_item.batch["token_level_scores"]
                                 response = batch_item.batch["responses"]
                                 prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
-                                ray_history_spec_tasks.append(history_rollout_trees.add_tree(prompt_id))
-                                ray_history_spec_tasks.append(history_rollout_trees.tree_append_node(
+                                ray_history_spec_tasks.append(self.history_rollout_trees.tree_append_node(
                                     prompt_id, response.numpy().tolist(), token_level_scores.sum().item()))
+                            self.history_rollout_trees.run_server()
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
