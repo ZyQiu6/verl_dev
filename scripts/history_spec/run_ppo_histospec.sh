@@ -16,7 +16,7 @@ export CUDA_VISIBLE_DEVICES='2,3'
 python3 -m verl.trainer.main_ppo \
     data.train_files=/data/qiuzy/programs/verl_dev/data/gsm8k/train.parquet \
     data.val_files=/data/qiuzy/programs/verl_dev/data/gsm8k/test.parquet \
-    data.train_batch_size=2048 \
+    data.train_batch_size=128 \
     data.val_batch_size=1312 \
     data.max_prompt_length=256 \
     data.max_response_length=4096 \

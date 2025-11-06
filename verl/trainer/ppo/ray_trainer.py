@@ -937,13 +937,20 @@ class RayPPOTrainer:
         fuse_buffer: DataProto = DataProto()
         overlapped_batch: DataProto = DataProto()
 
+        if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+            from vllm.v1.spec_decode.global_module.suffix_tree import \
+                get_history_trees
+            self.history_rollout_trees = get_history_trees()
+            # self.history_rollout_trees.clear()
+            # self.cache_write_manager = get_cache_write_manager()
+
         last_val_metrics = None
 
         begin_timestamp = time.time()
         self.training_datas = [deepcopy(batch_dict) for batch_dict in self.train_dataloader]
         for epoch in range(self.config.trainer.total_epochs):
             for i in range(len(self.training_datas)):
-                if i >= 5:
+                if i >= 1:
                     break
                 batch_dict = self.training_datas[i]
                 
@@ -1298,32 +1305,34 @@ class RayPPOTrainer:
                                 prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
                                 ray_history_spec_tasks.append(self.history_rollout_trees.delete(prompt_id)) # clear the tree every epoch
-                                ray_history_spec_tasks.append(self.history_rollout_trees.add_tree(prompt_id))
+                                ray_history_spec_tasks.append(self.history_rollout_trees.add_tree(prompt_id)) # clear the tree every epoch
                             ray.get(ray_history_spec_tasks)
                             ray_history_spec_tasks.clear()
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
                                 token_level_scores = batch_item.batch["token_level_scores"]
-                                response = batch_item.batch["responses"]
+                                response = batch_item.batch["responses"].numpy().tolist()
+                                try:
+                                    response_length = response.index(self.tokenizer.pad_token_id)
+                                    response = response[:response_length]
+                                except Exception as e:
+                                    response = response
                                 prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
                                 ray_history_spec_tasks.append(self.history_rollout_trees.tree_append_node(
-                                    prompt_id, response.numpy().tolist(), token_level_scores.sum().item()))
+                                    prompt_id, response, token_level_scores.sum().item()))
                             self.history_rollout_trees.run_server()
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with _timer("update_actor", timing_raw):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                            if fuse_enable:
-                                self.actor_rollout_wg.sync_fuse_actor_model_weights()
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
-                        
-                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
-                        ray.get(ray_history_spec_tasks)
+                    # if self.config.trainer.critic_warmup <= self.global_steps:
+                    #     # update actor
+                    #     with _timer("update_actor", timing_raw):
+                    #         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                    #         actor_output = self.actor_rollout_wg.update_actor(batch)
+                    #         if fuse_enable:
+                    #             self.actor_rollout_wg.sync_fuse_actor_model_weights()
+                    #     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    #     metrics.update(actor_output_metrics)
 
                     batch = unpad_dataproto(batch, pad_size=pad_size)
 
@@ -1352,6 +1361,10 @@ class RayPPOTrainer:
                             response_mask=response_masks,
                             dump_path=rollout_length_dir,
                         )
+
+                if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                    print("RAY GET")
+                    ray.get(ray_history_spec_tasks)
 
                 # validate
                 if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
@@ -1384,11 +1397,11 @@ class RayPPOTrainer:
                 print(f"metrics: {metrics}")
                 
                 gen_ratio = self.actor_rollout_wg.compute_executing_ratio(timing_raw['gen'], stage='generation')
-                actor_train_time = timing_raw['old_log_prob'] + timing_raw['update_actor']
-                train_ratio = self.actor_rollout_wg.compute_executing_ratio(actor_train_time, stage='train')
+                # actor_train_time = timing_raw['old_log_prob'] + timing_raw['update_actor']
+                # train_ratio = self.actor_rollout_wg.compute_executing_ratio(actor_train_time, stage='train')
                 for i in range(self.actor_rollout_wg.world_size):
                     print(f"for rank {i} in actor_rollout, executing gen ratio = {gen_ratio[i]['generation']}")
-                    print(f"for rank {i} in actor_rollout, executing train ratio = {train_ratio[i]['train']}")
+                    # print(f"for rank {i} in actor_rollout, executing train ratio = {train_ratio[i]['train']}")
                 if self.use_critic:
                     inference_ratio = self.critic_wg.compute_executing_ratio(timing_raw['values'], stage='inference')
                     train_ratio = self.critic_wg.compute_executing_ratio(timing_raw['update_critic'], stage='train')
