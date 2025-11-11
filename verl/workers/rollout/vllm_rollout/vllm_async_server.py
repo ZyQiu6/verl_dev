@@ -11,77 +11,72 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging
-from collections.abc import AsyncGenerator
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
-import cloudpickle
-import ray
-import time
-import torch
-import threading
+import argparse
 import asyncio
+import json
+import logging
+import os
+import pickle
+from pprint import pprint
+from typing import Any, Callable, Optional
+
 import numpy as np
-from torch.nn.utils.rnn import pad_sequence
-from verl import DataProto
-from contextlib import contextmanager
-from tensordict import TensorDict
-from torch import nn
+import ray
+import vllm.entrypoints.cli.serve
+import zmq
+from ray.actor import ActorHandle
 from vllm import SamplingParams
-from omegaconf import DictConfig
-from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
-from vllm import SamplingParams, AsyncLLMEngine
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.entrypoints.openai.api_server import (
+    build_app,
+    init_app_state,
+)
+from vllm.inputs import TokensPrompt
+from vllm.lora.request import LoRARequest
+from vllm.outputs import RequestOutput
+from vllm.usage.usage_lib import UsageContext
+from vllm.utils import FlexibleArgumentParser, get_tcp_uri
 from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.v1.engine.llm_engine import LLMEngine
+from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
-from vllm.worker.worker_base import WorkerWrapperBase
 
-from verl.utils.fs import copy_to_local
-from verl.workers.rollout.async_server import AsyncServerBase
-
-from uuid import uuid4
-from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
+from verl.single_controller.ray import RayClassWithInitArgs
+from verl.utils.config import omega_conf_to_dataclass
+from verl.workers.config import HFModelConfig, RewardModelConfig, RolloutConfig
+from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
+from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
+from verl.workers.rollout.vllm_rollout.utils import (
+    VLLM_LORA_INT_ID,
+    VLLM_LORA_NAME,
+    VLLM_LORA_PATH,
+    get_vllm_max_lora_rank,
+)
 
 logger = logging.getLogger(__file__)
+logger.setLevel(logging.INFO)
 
 
-class ExternalRayDistributedExecutor(Executor):
+class ExternalZeroMQDistributedExecutor(Executor):
     """An executor that engines are launched by external ray actors."""
 
     uses_ray: bool = False
 
     def _init_executor(self) -> None:
-        assert self.vllm_config.instance_id is not None, "instance_id must be set for external ray actors."
+        dp_rank_local = self.vllm_config.parallel_config.data_parallel_rank_local
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
 
-        fields = self.vllm_config.instance_id.split(":")
-        assert len(fields) == 4, f"instance_id: {self.vllm_config.instance_id} must be in the format of <namespace>:<wg_prefix>:<vllm_dp_size>:<vllm_dp_rank>."
-        namespace, wg_prefix, vllm_dp_size, vllm_dp_rank = fields[0], fields[1], int(fields[2]), int(fields[3])
-
-        # Make sure subprocess in same namespace as parent actor.
-        # actor name format: {name_prefix}WorkerDict_{pg_idx}:{local_rank}
-        ray.init(namespace=namespace)
-        actor_names = [actor_name for actor_name in ray.util.list_named_actors() if actor_name.startswith(f"{wg_prefix}WorkerDict")]
-
-        vllm_tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        assert len(actor_names) == vllm_dp_size * vllm_tp_size, f"instance_id: {self.vllm_config.instance_id} has {len(actor_names)} actors, but vllm_dp_size: {vllm_dp_size} * vllm_tp_size: {vllm_tp_size} = {vllm_dp_size * vllm_tp_size} is expected."
-
-        def get_pg_index_and_local_rank(actor_name) -> Tuple[int, int]:
-            fields = actor_name.split(":")
-            assert len(fields) == 2, f"invalid actor name: {actor_name}"
-            pg_index, local_rank = int(fields[0].split("_")[-1]), int(fields[1])
-            return pg_index, local_rank
-
-        # sort actor names by pg_index and local_rank
-        actor_names = sorted(actor_names, key=get_pg_index_and_local_rank)
-        actor_names = actor_names[vllm_dp_rank * vllm_tp_size : (vllm_dp_rank + 1) * vllm_tp_size]
-        self.workers: List[WorkerWrapperBase] = [ray.get_actor(actor_name) for actor_name in actor_names]
-        print(f"instance_id: {self.vllm_config.instance_id} intializes with external actors: {actor_names}")
+        addresses = os.environ["VERL_VLLM_ZMQ_ADDRESSES"].split(",")
+        addresses = addresses[dp_rank_local * tp_size : (dp_rank_local + 1) * tp_size]
+        self.context = zmq.Context()
+        self.sockets = []
+        for address in addresses:
+            socket = self.context.socket(zmq.REQ)
+            if address.startswith("tcp://["):
+                socket.setsockopt(zmq.IPV6, 1)
+            socket.connect(address)
+            self.sockets.append(socket)
 
         kwargs = dict(
             vllm_config=self.vllm_config,
@@ -90,531 +85,494 @@ class ExternalRayDistributedExecutor(Executor):
             distributed_init_method="env://",
             is_driver_worker=True,
         )
-        # for method in [method for method in dir(self.workers[0]) if callable(getattr(self.workers[0], method))]:
-        #     print(f"- {method}")
-
         self.collective_rpc("init_worker", args=([kwargs],))
         self.collective_rpc("init_device")
         self.collective_rpc("load_model")
-        print(f"instance_id: {self.vllm_config.instance_id} intializes finished.")
 
     def collective_rpc(
         self,
-        method: Union[str, Callable],
+        method: str | Callable,
         timeout: Optional[float] = None,
-        args: Tuple = (),
-        kwargs: Optional[Dict[str, Any]] = None,
-    ) -> List[Any]:
-        # TODO(wuxibin): support ray compiled graph
+        args: tuple = (),
+        kwargs: Optional[dict[str, Any]] = None,
+        **kwargs_extra: Any,
+    ) -> list[Any]:
         if isinstance(method, str):
             sent_method = method
         else:
-            sent_method = cloudpickle.dumps(method)
+            sent_method = pickle.dumps(method)
         del method
 
-        outputs = ray.get([worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers])
+        message = pickle.dumps((sent_method, args, kwargs or {}))
+        for socket in self.sockets:
+            socket.send(message, zmq.DONTWAIT)
+
+        outputs = []
+        for socket in self.sockets:
+            outputs.append(pickle.loads(socket.recv()))
+
+        for output in outputs:
+            if isinstance(output, Exception):
+                raise output
         return outputs
 
     def check_health(self):
         return
 
 
-@ray.remote(num_cpus=1)
-class AsyncvLLMServer(AsyncServerBase):
-    """
-    AsyncvLLMServer is a wrapper for AsyncLLM, it uses ExternalRayDistributedExecutor to launch engines
-    in hybrid rollout workers, i.e AsyncActorRolloutRefWorker.
-
-    AsyncvLLMServer works as follows:
-    1. Start FastAPI server first.
-    2. Initialize AsyncLLM with ExternalRayDistributedExecutor.
-    3. AsyncLLM spawn EngineCore in subprocess.
-    4. EngineCore initialize ExternalRayDistributedExecutor.
-    5. ExternalRayDistributedExecutor lookup its corresponding actors by name.
-    6. ExternalRayDistributedExecutor init executor: init_worker, init_device, load_model.
-
-    For vLLM AsyncLLM design, see: https://github.com/vllm-project/vllm/pull/9826
+class vLLMHttpServerBase:
+    """vLLM http server in single node, this is equivalent to launch server with command line:
+    ```
+    vllm serve --tensor-parallel-size=8 ...
+    ```
     """
 
-    def __init__(self, config: DictConfig, vllm_dp_size: int, vllm_dp_rank: int, wg_prefix: str):
+    def __init__(
+        self,
+        config: RolloutConfig,
+        model_config: HFModelConfig,
+        rollout_mode: RolloutMode,
+        workers: list[ActorHandle],
+        replica_rank: int,
+        node_rank: int,
+        gpus_per_node: int,
+        nnodes: int,
+    ):
         """
         Args:
-            config: DictConfig, actor_rollout_ref config.
-            vllm_dp_size: int, vllm data parallel size.
-            vllm_dp_rank: int, vllm data parallel rank.
-            wg_prefix: str, worker group prefix, used to lookup actors.
+            config (RolloutConfig): full config.
+            model_config (HFModelConfig): model config.
+            rollout_mode (RolloutMode): rollout mode.
+            replica_rank (int): replica rank, a replica may contain multiple nodes.
+            node_rank (int): node rank.
+            gpus_per_node (int): number of gpus per node.
+            nnodes (int): number of nodes.
         """
         super().__init__()
 
-        self.config = config
-        self.vllm_dp_size = vllm_dp_size
-        self.vllm_dp_rank = vllm_dp_rank
-        self.wg_prefix = wg_prefix
-        self.engine: AsyncLLM = None
-        self.stop_flag = False
+        self.config: RolloutConfig = omega_conf_to_dataclass(config)
+        self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+        self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        self.rollout_mode = rollout_mode
+        self.workers = workers
 
-        # Init user provided chat scheduler in sperate thread.
-        self.generation_loop = None
-        self.generation_ready = threading.Event()
-        self.generation_thread = threading.Thread(target=self._init_generation_loop, daemon=True)
-        self.generation_thread.start()
+        self.replica_rank = replica_rank
+        self.node_rank = node_rank
+        self.gpus_per_node = gpus_per_node
+        self.nnodes = nnodes
 
-    def _init_generation_loop(self):
-        self.generation_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.generation_loop)
-        self.generation_loop.run_forever()
+        if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
+            logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
+            self.config.load_format = "auto"
 
-    async def init_engine(self):
-        """Init vLLM AsyncLLM engine."""
-        config = self.config
-        model_path = config.model.path
-        model_name = "/".join(model_path.split("/")[-2:])
-        local_path = copy_to_local(model_path)
-        trust_remote_code = config.model.get("trust_remote_code", False)
-        config = config.rollout
+        # used for http server
+        self._server_address = ray.util.get_node_ip_address().strip("[]")
+        self._server_port = None
 
-        tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
-        max_num_batched_tokens = config.get("max_num_batched_tokens", 8192)
-        load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
-        max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
-        max_model_len = int(max_model_len)
+        # used for data parallel: --data-parallel-address, --data-parallel-rpc-port
+        if self.node_rank == 0:
+            self._master_address = self._server_address
+            self._master_port, self._master_sock = get_free_port(self._server_address)
+            self._dp_master_port, self._dp_master_sock = get_free_port(self._server_address)
+            logger.info(
+                f"vLLMHttpServer, replica_rank: {self.replica_rank}, master address: {self._master_address}, "
+                f"master port: {self._master_port}, data parallel master port: {self._dp_master_port}"
+            )
+        else:
+            self._master_address = None
+            self._master_port = None
+
+    def get_master_address(self):
+        """Get master address and port for data parallel."""
+        return self._master_address, self._master_port
+
+    def get_server_address(self):
+        """Get http server address and port."""
+        assert self._server_port is not None, "http server is not launched, port is None"
+        return self._server_address, self._server_port
+
+    async def launch_server(self, master_address: str = None, master_port: int = None):
+        if self.node_rank != 0:
+            assert master_address and master_port, "non-master node should provide master address and port"
+            self._master_address = master_address
+            self._master_port = master_port
+
+        # 1. setup vllm serve cli args
+        engine_kwargs = self.config.get("engine_kwargs", {}).get("vllm", {}) or {}
+        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        if self.config.get("limit_images", None):  # support for multi-image data
+            engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
+        if self.config.cudagraph_capture_sizes:
+            engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
-        kwargs = dict(
-            n=1,
-            logprobs=0,
-            max_tokens=config.response_length,
+        override_generation_config = dict(
+            temperature=self.config.temperature,
+            top_k=self.config.top_k,
+            top_p=self.config.top_p,
+            repetition_penalty=1.0,
+            max_new_tokens=self.config.response_length,
         )
-        for k in config.keys():
-            if hasattr(SamplingParams(), str(k)):
-                kwargs[k] = config.get(k)
-        print(f"override_generation_config: {kwargs}")
-        self.sampling_params = kwargs
+        logger.info(f"override_generation_config: {override_generation_config}")
 
-        engine_args = AsyncEngineArgs(
-            model=local_path,
-            enable_sleep_mode=True,
-            override_generation_config=kwargs,
-            tensor_parallel_size=tensor_parallel_size,
-            distributed_executor_backend=ExternalRayDistributedExecutor,
-            dtype=config.dtype,
-            enforce_eager=config.enforce_eager,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            disable_custom_all_reduce=True,
-            disable_mm_preprocessor_cache=True,
-            skip_tokenizer_init=False,
-            max_model_len=max_model_len,
-            disable_log_stats=config.disable_log_stats,
-            max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=False,
-            trust_remote_code=trust_remote_code,
-            seed=self.vllm_dp_rank,
+        args = {
+            "dtype": self.config.dtype,
+            "load_format": self.config.load_format,
+            "skip_tokenizer_init": False,
+            # "trust_remote_code": True,
+            "max_model_len": self.config.max_model_len,
+            "max_num_seqs": self.config.max_num_seqs,
+            "enable_chunked_prefill": self.config.enable_chunked_prefill,
+            "max_num_batched_tokens": self.config.max_num_batched_tokens,
+            "enable_prefix_caching": self.config.enable_prefix_caching,
+            "enable_sleep_mode": True,
+            "disable_custom_all_reduce": True,
+            "enforce_eager": self.config.enforce_eager,
+            "gpu_memory_utilization": self.config.gpu_memory_utilization,
+            "disable_log_stats": self.config.disable_log_stats,
+            "tensor_parallel_size": self.config.tensor_model_parallel_size,
+            "seed": self.config.get("seed", 0),
+            "override_generation_config": json.dumps(override_generation_config),
+            **engine_kwargs,
+        }
+        if self.config.expert_parallel_size > 1:
+            assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
+                "gpus_per_node should be divisible by tensor_model_parallel_size"
+            )
+            data_parallel_size_local = self.gpus_per_node // self.config.tensor_model_parallel_size
+            assert len(self.workers) == data_parallel_size_local * self.config.tensor_model_parallel_size, (
+                f"num workers ({len(self.workers)}) should be equal to dp_size_local "
+            )
+            f"({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
+
+            args.update(
+                {
+                    "enable_expert_parallel": self.config.expert_parallel_size > 1,
+                    "data_parallel_size": self.config.data_parallel_size,
+                    "data_parallel_size_local": data_parallel_size_local,
+                    "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
+                    "data_parallel_address": self._master_address,
+                    "data_parallel_rpc_port": self._master_port,
+                }
+            )
+
+        # update lora-related args
+        if self.model_config.lora_rank > 0:
+            args.update(
+                {
+                    "enable_lora": True,
+                    "max_loras": 1,
+                    "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank),
+                }
+            )
+
+        server_args = ["serve", self.model_config.local_path]
+        for k, v in args.items():
+            if isinstance(v, bool):
+                if v:
+                    server_args.append(f"--{k}")
+            else:
+                server_args.append(f"--{k}")
+                server_args.append(str(v))
+
+        if self.replica_rank == 0:
+            pprint(server_args)
+
+        CMD_MODULES = [vllm.entrypoints.cli.serve]
+        parser = FlexibleArgumentParser(description="vLLM CLI")
+        subparsers = parser.add_subparsers(required=False, dest="subparser")
+        cmds = {}
+        for cmd_module in CMD_MODULES:
+            new_cmds = cmd_module.cmd_init()
+            for cmd in new_cmds:
+                cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+                cmds[cmd.name] = cmd
+        server_args = parser.parse_args(args=server_args)
+        server_args.model = server_args.model_tag
+        if server_args.subparser in cmds:
+            cmds[server_args.subparser].validate(server_args)
+
+        # 2. setup distributed executor backend
+        distributed_executor_backend = ExternalZeroMQDistributedExecutor if len(self.workers) > 0 else None
+        server_args.distributed_executor_backend = distributed_executor_backend
+
+        zmq_addresses = ray.get([worker.get_zeromq_address.remote() for worker in self.workers])
+        logger.info(
+            f"replica_rank={self.replica_rank}, node_rank={self.node_rank}, nnodes={self.nnodes}, "
+            f"get worker zmq addresses: {zmq_addresses}"
+        )
+        os.environ["VERL_VLLM_ZMQ_ADDRESSES"] = ",".join(zmq_addresses)
+
+        # 3. launch server
+        if self.node_rank == 0:
+            await self.run_server(server_args)
+        else:
+            await self.run_headless(server_args)
+
+    async def run_server(self, args: argparse.Namespace):
+        engine_args = AsyncEngineArgs.from_cli_args(args)
+        usage_context = UsageContext.OPENAI_API_SERVER
+        vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+        vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
+
+        engine_client = AsyncLLM.from_vllm_config(
+            vllm_config=vllm_config,
+            usage_context=usage_context,
+            disable_log_requests=engine_args.disable_log_requests,
+            disable_log_stats=engine_args.disable_log_stats,
         )
 
-        # init async llm engine
-        vllm_config = engine_args.create_engine_config()
-        namespace = ray.get_runtime_context().namespace
-        vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
-        self.engine = AsyncLLM.from_vllm_config(vllm_config)
-        # self.engine = AsyncLLMEngine.from_vllm_config(vllm_config)
+        # Don't keep the dummy data in memory
+        await engine_client.reset_mm_cache()
 
-        self.pad_token_id = self.engine.tokenizer.tokenizer.pad_token_id if hasattr(self.engine.tokenizer.tokenizer, 'pad_token_id') is not None \
-                                else self.engine.tokenizer.tokenizer.eos_token_id
-        self.eos_token_id = self.engine.tokenizer.tokenizer.eos_token_id
-        self.collect_tasks = []
-        self.prompt_info = {}
-        self.output_buffer = {} # store request_output
-        self.partial_enable_ids = []
-        self.replay_buffer: dict[str, dict] = {} # for partial rollout
+        app = build_app(args)
+        await init_app_state(engine_client, vllm_config, app.state, args)
+        if self.replica_rank == 0 and self.node_rank == 0:
+            logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
+
+        self.engine = engine_client
+        self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
+
+    async def run_headless(self, args: argparse.Namespace):
+        # Create the EngineConfig.
+        engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+        usage_context = UsageContext.OPENAI_API_SERVER
+        vllm_config = engine_args.create_engine_config(usage_context=usage_context, headless=True)
+
+        parallel_config = vllm_config.parallel_config
+        local_engine_count = parallel_config.data_parallel_size_local
+
+        host = parallel_config.data_parallel_master_ip
+        port = engine_args.data_parallel_rpc_port  # add to config too
+        handshake_address = get_tcp_uri(host, port)
+
+        # Create the engines.
+        self.engine_manager = CoreEngineProcManager(
+            target_fn=EngineCoreProc.run_engine_core,
+            local_engine_count=local_engine_count,
+            start_index=vllm_config.parallel_config.data_parallel_rank,
+            local_start_index=0,
+            vllm_config=vllm_config,
+            local_client=False,
+            handshake_address=handshake_address,
+            executor_class=Executor.get_class(vllm_config),
+            log_stats=not engine_args.disable_log_stats,
+        )
+
+    async def generate(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+    ) -> TokenOutput:
+        """Generate sequence with token-in-token-out."""
+        # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
+        max_tokens = self.config.max_model_len - len(prompt_ids)
+        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        prompt = TokensPrompt(
+            prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
+        )
+
+        # Add lora request
+        lora_request = None
+        if self.model_config.lora_rank > 0:
+            # Make sure we also check that the lora is already loaded in the engine
+            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+            if lora_loaded:
+                lora_request = LoRARequest(
+                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+                )
+
+        generator = self.engine.generate(
+            prompt=prompt, sampling_params=sampling_params, request_id=request_id, lora_request=lora_request
+        )
+
+        # Get final response
+        final_res: Optional[RequestOutput] = None
+        async for output in generator:
+            final_res = output
+        assert final_res is not None
+
+        token_ids = final_res.outputs[0].token_ids
+        log_probs = None
+        if sampling_params.logprobs is not None:
+            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+        return TokenOutput(token_ids=token_ids, log_probs=log_probs)
 
     async def wake_up(self):
-        await self.engine.wake_up()
+        if self.rollout_mode == RolloutMode.HYBRID:
+            # Call all workers to switch between trainer mode and rollout mode.
+            await asyncio.gather(*[worker.wake_up.remote() for worker in self.workers])
+        elif self.rollout_mode == RolloutMode.COLOCATED:
+            # Directly call engine to wake up without sync weights.
+            if self.node_rank == 0:
+                await self.engine.wake_up(tags=["kv_cache", "weights"])
+        elif self.rollout_mode == RolloutMode.STANDALONE:
+            logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
-        # TODO: https://github.com/vllm-project/vllm/issues/17103
-        await self.engine.reset_prefix_cache()
-        await self.engine.sleep()
+        if self.rollout_mode == RolloutMode.HYBRID:
+            if self.node_rank == 0:
+                await self.engine.reset_prefix_cache()
+            await asyncio.gather(*[worker.sleep.remote() for worker in self.workers])
+        elif self.rollout_mode == RolloutMode.COLOCATED:
+            if self.node_rank == 0:
+                await self.engine.reset_prefix_cache()
+                await self.engine.sleep(level=1)
+        elif self.rollout_mode == RolloutMode.STANDALONE:
+            logger.info("skip sleep in standalone mode")
 
-    @contextmanager
-    def update_sampling_params(self, **kwargs):
-        # update sampling params
-        old_sampling_params_args = {}
-        if kwargs:
-            for key, value in kwargs.items():
-                if hasattr(self.sampling_params, key):
-                    old_value = getattr(self.sampling_params, key)
-                    old_sampling_params_args[key] = old_value
-                    setattr(self.sampling_params, key, value)
-        # self.sampling_params['skip_special_tokens'] = False
-        yield
-        # roll back to previous sampling params
-        # if len(old_sampling_params_args):
-        for key, value in old_sampling_params_args.items():
-            setattr(self.sampling_params, key, value)
+    async def wait_for_requests_to_drain(self):
+        await self.engine.wait_for_requests_to_drain()
 
-    async def collect_output(self, output_generator, request_id, do_print=False, async_mode=False):
-        final_output = None
-        try:
-            async for output in output_generator:
-                final_output = output
-                if do_print:
-                    print(f"Partial result: {output.outputs[0].text}")
-            if async_mode:
-                if request_id in self.replay_buffer:
-                    if 'token_ids' in self.replay_buffer[request_id]:
-                        final_output.outputs[0].token_ids = \
-                            self.replay_buffer[request_id]["token_ids"] + final_output.outputs[0].token_ids
-                    else:
-                        self.output_buffer[request_id] = final_output
-                else:
-                    self.output_buffer[request_id] = final_output
-        except asyncio.CancelledError:
-            await self.engine.abort(request_id)
-            if request_id in self.partial_enable_ids:
-                self.replay_buffer[request_id]["gen_output"] = final_output
-            # print(f"async server cancel request {request_id}")
-            raise
-        
-        if request_id in self.partial_enable_ids:
-            self.partial_enable_ids.remove(request_id)
-            del self.replay_buffer[request_id]
-        return final_output
 
-    def rollout_finished(self, item) -> bool:
-        # item should be DataProtoItem, mainly for generate_sequences_fused
-        response = item.batch['responses']
+@ray.remote(num_cpus=1)
+class vLLMHttpServer(vLLMHttpServerBase):
+    """vLLM http server in single node, this is equivalent to launch server with command line:
+    ```
+    vllm serve --tensor-parallel-size=8 ...
+    ```
+    """
 
-        # 1. check if eos_token exists
-        eos_token_id = item.meta_info['eos_token_id']
-        eos_mask = torch.isin(response, torch.tensor(eos_token_id, device=response.device)).int()
-        if eos_mask.sum().item() > 0:
-            return True
-        
-        # 2. check if length reaches max_length
-        response_mask = self.get_response_mask_by_pad_id(response)
-        response_length = response_mask.sum().float().item()
-        if response_length >= self.config.response_length:
-            return True
-        
-        return False
-    
-    def get_response_mask_by_pad_id(self, response_id: torch.Tensor, dtype=torch.int64):
-        response_mask = torch.isin(response_id, torch.tensor(self.pad_token_id, device=response_id.device)).int()
-        response_mask = response_mask.eq(0).to(dtype)
-        return response_mask
+    def __init__(
+        self,
+        config: RolloutConfig | RewardModelConfig,
+        model_config: HFModelConfig,
+        rollout_mode: RolloutMode,
+        workers: list[ActorHandle],
+        replica_rank: int,
+        node_rank: int,
+        gpus_per_node: int,
+        nnodes: int,
+    ):
+        super().__init__(config, model_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes)
 
-    def _post_process_output(self, request_outputs) -> Tuple[torch.Tensor, List[bool], List[bool]]:
-        output_token_ids = []
-        output_finished = []
-        seq_finished = []
-        
-        for request_output in request_outputs:  # List[RequestOutput]
-            outputs = request_output.outputs
-            output_finished.extend([request_output.finished for _ in outputs])
-            for output in outputs:  # List[CompletionOutput], usually len == 1
-                output_token_ids.append(torch.tensor(output.token_ids))
-                seq_finished.append(output.finished())
 
-        pad_token_id = self.engine.tokenizer.tokenizer.pad_token_id if hasattr(self.engine.tokenizer.tokenizer, 'pad_token_id') is not None \
-                        else self.engine.tokenizer.tokenizer.eos_token_id
-        output_token_ids = pad_sequence(output_token_ids, batch_first=True, padding_value=pad_token_id)
-        # output_fused already repeats n
-        return output_token_ids, output_finished, seq_finished
+_rollout_worker_actor_cls = ray.remote(vLLMAsyncRollout)
 
-    def start_generation(self):
-        self.stop_flag = False
 
-    def stop_generation(self):
-        self.stop_flag = True
-        for task in self.collect_tasks:
-            task.cancel()
-        self.collect_tasks.clear()
-        for request_id in list(self.prompt_info.keys()):
-            if request_id in self.partial_enable_ids:
-                continue
-            else:
-                del self.prompt_info[request_id]
-            if request_id in self.output_buffer:
-                del self.output_buffer[request_id]
+class vLLMReplica(RolloutReplica):
+    def __init__(
+        self,
+        replica_rank: int,
+        config: RolloutConfig | RewardModelConfig,
+        model_config: HFModelConfig,
+        gpus_per_node: int = 8,
+        is_reward_model: bool = False,
+    ):
+        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
+        self.server_class = vLLMHttpServer
 
-    def add_generation_task(self, raw_prompt, sampling_params, request_id, do_print=False, async_mode=False):
-        output_generator = self.engine.generate(
-                                prompt=raw_prompt,
-                                sampling_params=sampling_params,
-                                request_id=request_id
-                            )
-        task = asyncio.create_task(
-                    self.collect_output(
-                        output_generator=output_generator,
-                        request_id=request_id,
-                        do_print=do_print,
-                        async_mode=async_mode
-                    )
-                )
-        self.collect_tasks.append(task)
+    def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
+        """Get rollout worker actor class for colocated and standalone mode."""
+        worker_dict_cls = RayClassWithInitArgs(
+            cls=_rollout_worker_actor_cls,
+            config=self.config,
+            model_config=self.model_config,
+            device_mesh=None,
+        )
+        return worker_dict_cls
 
-    def transfer_replay(self):
-        request_ids = list(self.replay_buffer.keys())
-        for request_id in request_ids:
-            gen_output = self.replay_buffer[request_id]["gen_output"]
-            if "token_ids" in self.replay_buffer[request_id]:
-                token_ids = self.replay_buffer[request_id]["token_ids"] + gen_output.outputs[0].token_ids
-            else:
-                token_ids = gen_output.outputs[0].token_ids
-            self.replay_buffer[request_id]["token_ids"] = token_ids
-            self.replay_buffer[request_id]["gen_output"] = None
-            # add to generate
-            self.replay_buffer[request_id]["sampling_params"]['max_tokens'] = \
-                self.config.rollout.response_length - len(token_ids)
-            prompt = self.replay_buffer[request_id]["raw_prompt"] + token_ids
-            self.add_generation_task(
-                raw_prompt=prompt,
-                sampling_params=SamplingParams(**self.replay_buffer[request_id]["sampling_params"]),
-                request_id=request_id,
-                # do_print=(batch_index < 1)
-                async_mode=True
+    async def launch_servers(self):
+        """Launch http server in each node."""
+        assert len(self.workers) == self.world_size, (
+            f"worker number {len(self.workers)} not equal to world size {self.world_size}"
+        )
+
+        # get node_id of all workers
+        worker_node_ids = await asyncio.gather(
+            *[
+                worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
+                for worker in self.workers
+            ]
+        )
+
+        # For non-data parallel case, there's only one server whether it's single or multi nodes.
+        nnodes, gpus_per_node = self.nnodes, self.gpus_per_node
+        if self.config.data_parallel_size == 1:
+            nnodes = 1
+            gpus_per_node = self.world_size
+
+        # create server actor in each node with node affinity
+        for node_rank in range(nnodes):
+            workers = self.workers[node_rank * gpus_per_node : (node_rank + 1) * gpus_per_node]
+            node_id = worker_node_ids[node_rank * gpus_per_node]
+            name = (
+                f"vllm_server_{self.replica_rank}_{node_rank}"
+                if not self.is_reward_model
+                else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
             )
-        return len(request_ids) > 0
-
-    async def generate_sequences_async(self, prompts, **kwargs):
-        if 'uid' in prompts.non_tensor_batch.keys():
-            uids = prompts.non_tensor_batch['uid']
-        else:
-            raise ValueError("Uids of prompts is needed in generate_sequences_async")
-
-        do_sample = prompts.meta_info.get("do_sample", True)
-        is_validate = prompts.meta_info.get("validate", False)
-        if not do_sample:
-            kwargs = {
-                "best_of": 1,
-                "top_p": 1.0,
-                "top_k": -1,
-                "min_p": 0.0,
-                "temperature": 0,
-                "n": 1,  # if greedy, only 1 response
-            }
-        elif is_validate:
-            # TODO: try **
-            kwargs = {
-                "top_k": self.config.rollout.val_kwargs.top_k,
-                "top_p": self.config.rollout.val_kwargs.top_p,
-                "temperature": self.config.rollout.val_kwargs.temperature,
-                "n": 1,  # if validate, already repeat in ray_trainer
-            }
-
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            for batch_index, raw_prompt in enumerate(prompts.non_tensor_batch['raw_prompt']):
-                if batch_index < 1:
-                    print(f"conversation: {raw_prompt}")
-                request_id = uids[batch_index]
-                if prompts.meta_info['partial_rollout_enable']:
-                    assert self.config.rollout.n == 1, f"when using partial rollout in async rollout, \
-                                                    n must be equal to 1"
-                    self.replay_buffer[request_id] = {
-                        'raw_prompt': self.engine.tokenizer.encode(raw_prompt),
-                        'sampling_params': self.sampling_params,
-                    }
-                    self.partial_enable_ids.append(request_id)
-                self.add_generation_task(
-                    raw_prompt=raw_prompt,
-                    sampling_params=SamplingParams(**self.sampling_params),
-                    request_id=request_id,
-                    # do_print=(batch_index < 1)
-                    async_mode=True
-                )
-                self.prompt_info[request_id] = prompts[batch_index]
-
-    async def collect_outputs_async(self, batch_size: int):
-        batch_size = int(batch_size)
-        tasks = set(self.collect_tasks)
-        while len(self.output_buffer) < batch_size and tasks:
-            done, tasks = await asyncio.wait(
-                tasks,
-                return_when=asyncio.FIRST_COMPLETED
+            server = self.server_class.options(
+                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=node_id,
+                    soft=False,
+                ),
+                name=name,
+            ).remote(
+                config=self.config,
+                model_config=self.model_config,
+                rollout_mode=self.rollout_mode,
+                workers=workers,
+                replica_rank=self.replica_rank,
+                node_rank=node_rank,
+                gpus_per_node=gpus_per_node,
+                nnodes=nnodes,
             )
-        if self.stop_flag or len(self.output_buffer) < batch_size:
-            return None
-        self.collect_tasks = list(tasks)
-        # while len(self.output_buffer) < batch_size:
-        #     await asyncio.sleep(0.2)
-        generate_outputs = []
-        selected_prompt_info = []
-        selected_uids = list(self.output_buffer.keys())[:batch_size]
-        # use uid to select responding outputs
-        for k in selected_uids:
-            generate_outputs.append(self.output_buffer.pop(k))
-            selected_prompt_info.append(self.prompt_info.pop(k))
-        
-        idx = torch.tensor([info.batch['input_ids'].tolist() for info in selected_prompt_info]).cpu()
-        attention_mask = torch.tensor([info.batch['attention_mask'].tolist() for info in selected_prompt_info]).to(idx.device)
-        position_ids = torch.tensor([info.batch['position_ids'].tolist() for info in selected_prompt_info]).to(idx.device)
-        do_sample = selected_prompt_info[0].meta_info.get("do_sample", True)
-        output = self._post_process_output(generate_outputs)
+            self.servers.append(server)
 
-        # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-        response = output[0].to(idx.device)
-        # output_finished = output[1]
-        # seq_finished = output[2]
+        # launch http server in each node
+        master_address, master_port = await self.servers[0].get_master_address.remote()
+        await asyncio.gather(
+            *[
+                server.launch_server.remote(master_address=master_address, master_port=master_port)
+                for server in self.servers
+            ]
+        )
 
-        if response.shape[1] < self.config.rollout.response_length:
-            response = pad_sequence_to_length(response, self.config.rollout.response_length, self.pad_token_id)
+        # get http server address from first server
+        server_address, server_port = await self.servers[0].get_server_address.remote()
+        self._server_handle = self.servers[0]
+        self._server_address = (
+            f"[{server_address}]:{server_port}"
+            if is_valid_ipv6_address(server_address)
+            else f"{server_address}:{server_port}"
+        )
 
-        if self.config.rollout.n > 1 and do_sample:
-            idx = idx.repeat_interleave(self.config.rollout.n, dim=0)
-            attention_mask = attention_mask.repeat_interleave(self.config.rollout.n, dim=0)
-            position_ids = position_ids.repeat_interleave(self.config.rollout.n, dim=0)
-            batch_size = batch_size * self.config.rollout.n
-            # output_finished = np.repeat(np.array(output_finished, dtype=object), self.config.rollout.n, axis=0)
-        seq = torch.cat([idx, response], dim=-1)
+    async def sleep(self):
+        """Sleep each rollout server."""
+        # Drain DP engines for safe sleep.
+        await self.servers[0].wait_for_requests_to_drain.remote()
+        await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
 
-        # TODO(sgm): fix position_ids on right_pad
-        # prompt: left pad + response: right pad
-        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-        response_position_ids = position_ids[:, -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = self.get_response_mask_by_pad_id(response)
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
-        
-        batch_dict = {
-                'prompts': idx,
-                'responses': response,
-                'input_ids': seq,  # here input_ids become the whole sentences
-                'attention_mask': attention_mask,
-                'position_ids': position_ids,
-            }
+def _qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
+    """Deduplicate consecutive image tokens in prompt_ids for Qwen2.5-VL, since vLLM will replicate the
+    <|image_pad|> token by image_data.
 
-        # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            batch_dict,
-            batch_size=batch_size)
-        non_tensor_batch = {
-            'uid': np.array(selected_uids, dtype=object)
-        }
+    For example,
+    ```
+    <|vision_start|><|image_pad|><|image_pad|>...<|image_pad|><|vision_end|>
+    =>
+    <|vision_start|><|image_pad|><|vision_end|>
+    ```
+    """
+    if processor is not None and "Qwen2VLImageProcessor" in processor.image_processor.__class__.__name__:
+        prompt_ids = np.array(prompt_ids)
 
-        output_proto = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
-        
-        return output_proto
+        # Create a mask where True indicates elements to keep
+        mask = np.ones(len(prompt_ids), dtype=bool)
 
-    async def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        partial_rollout_enable = False
-        if 'partial_rollout_enable' in prompts.meta_info:
-            partial_rollout_enable = prompts.meta_info['partial_rollout_enable']
-        if 'uid' in prompts.non_tensor_batch.keys():
-            uids = prompts.non_tensor_batch.pop('uid')
-        else:
-            uids = None
+        # Find where the array equals the value
+        is_value = prompt_ids == processor.image_token_id
 
-        idx = prompts.batch["input_ids"]  # (bs, prompt_length)
-        # left-padded attention_mask
-        attention_mask = prompts.batch["attention_mask"]
-        position_ids = prompts.batch["position_ids"]
+        # Find consecutive duplicates by checking if previous element is also the value
+        mask[1:] &= ~(is_value[1:] & is_value[:-1])
 
-        # used to construct attention_mask
-        # eos_token_id = prompts.meta_info["eos_token_id"]
-
-        batch_size = idx.size(0)
-
-        # idx_list = []
-        # parse idx from torch.Tensor to List[List[str]]
-        # for i in range(batch_size):
-        #     idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
-
-        do_sample = prompts.meta_info.get("do_sample", True)
-        is_validate = prompts.meta_info.get("validate", False)
-        if not do_sample:
-            kwargs = {
-                "best_of": 1,
-                "top_p": 1.0,
-                "top_k": -1,
-                "min_p": 0.0,
-                "temperature": 0,
-                "n": 1,  # if greedy, only 1 response
-            }
-        elif is_validate:
-            # TODO: try **
-            kwargs = {
-                "top_k": self.config.rollout.val_kwargs.top_k,
-                "top_p": self.config.rollout.val_kwargs.top_p,
-                "temperature": self.config.rollout.val_kwargs.temperature,
-                "n": 1,  # if validate, already repeat in ray_trainer
-            }
-
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            tasks = []
-            generate_outputs = []
-            for batch_index, raw_prompt in enumerate(prompts.non_tensor_batch['raw_prompt']):
-                if batch_index < 1:
-                    print(f"conversation: {raw_prompt}")
-                if uids is None:
-                    request_id = uuid4().hex
-                else:
-                    request_id = uids[batch_index]
-                self.add_generation_task(raw_prompt=raw_prompt,
-                                        sampling_params=SamplingParams(**self.sampling_params),
-                                        request_id=request_id)
-            generate_outputs = await asyncio.gather(*self.collect_tasks)
-            # generate_outputs = await asyncio.gather(*tasks)
-            self.collect_tasks.clear()
-
-        # print(f"generate_outputs = {generate_outputs}")
-        output = self._post_process_output(generate_outputs)
-
-        # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-        response = output[0].to(idx.device)
-        # output_finished = output[1]
-        # seq_finished = output[2]
-
-        if response.shape[1] < self.config.rollout.response_length:
-            response = pad_sequence_to_length(response, self.config.rollout.response_length, self.pad_token_id)
-
-        if partial_rollout_enable:
-            n_seqs: bool = self.config.rollout.n > 1
-            # self.inference_engine.reschedule_partial_requests(n_seqs)
-
-        if self.config.rollout.n > 1 and do_sample:
-            idx = idx.repeat_interleave(self.config.rollout.n, dim=0)
-            attention_mask = attention_mask.repeat_interleave(self.config.rollout.n, dim=0)
-            position_ids = position_ids.repeat_interleave(self.config.rollout.n, dim=0)
-            batch_size = batch_size * self.config.rollout.n
-            # output_finished = np.repeat(np.array(output_finished, dtype=object), self.config.rollout.n, axis=0)
-        seq = torch.cat([idx, response], dim=-1)
-
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
-
-        # TODO(sgm): fix position_ids on right_pad
-        # prompt: left pad + response: right pad
-        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-        response_position_ids = position_ids[:, -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        # response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
-        response_attention_mask = self.get_response_mask_by_pad_id(response)
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
-        
-        batch_dict = {
-                'prompts': idx,
-                'responses': response,
-                'input_ids': seq,  # here input_ids become the whole sentences
-                'attention_mask': attention_mask,
-                'position_ids': position_ids,
-            }
-
-        # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            batch_dict,
-            batch_size=batch_size)
-
-        output_proto = DataProto(batch=batch)
-        
-        return output_proto
+        return prompt_ids[mask].tolist()
+    else:
+        return prompt_ids

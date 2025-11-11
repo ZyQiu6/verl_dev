@@ -18,12 +18,7 @@ tensorflow/my_graph/*
 .idea/
 # C extensions
 *.so
-.runs/
-#nsys
-*.qdrep
-*.sqlite
-*.nsys-rep
-*.json
+
 # Distribution / packaging
 .Python
 env/
@@ -63,6 +58,8 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+pytest.ini
+output.txt
 
 # Translations
 *.mo
@@ -120,16 +117,6 @@ ENV/
 # ckpt
 *.lock
 
-# output
-**/output**
-slurm**
-**.png
-plot**
-dump/**
-
-# data
-data/**.parquet
-**.parquet
 # data
 *.parquet
 
@@ -138,5 +125,4 @@ data/**.parquet
 logs
 log
 outputs
-mlruns
-**.out
+.history
