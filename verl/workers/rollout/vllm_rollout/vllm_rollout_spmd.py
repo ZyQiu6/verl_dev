@@ -230,6 +230,8 @@ class vLLMRollout(BaseRollout):
         print("compilation_config:", compilation_config)
         # max_num_seqs=config.max_num_seqs,
         # max_num_batched_tokens=max_num_batched_tokens,
+        visible = torch.cuda.device_count()
+        print("vllm can see cuda devices:", visible)
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -536,9 +538,9 @@ class vLLMRollout(BaseRollout):
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
         
-        #after one batch, show record
-        print("MoE Stats in vllm")
-        moe_stats.snapshot()
+        # #after one batch, show record
+        # print("MoE Stats in vllm")
+        # moe_stats.snapshot()
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

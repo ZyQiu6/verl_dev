@@ -977,6 +977,8 @@ class RayPPOTrainer:
 
         begin_timestamp = time.time()
         for epoch in range(self.config.trainer.total_epochs):
+            #正式训练前，清空记录
+            self.actor_rollout_wg.flush_record()
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -995,10 +997,11 @@ class RayPPOTrainer:
                 )
 
                 gen_batch = self._get_gen_batch(batch)
-
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                # print(f"gen_batch_size is: {len(gen_batch.non_tensor_batch['index'])}", "global_steps is " ,self.global_steps)
+                # print("gen index is: ", gen_batch.non_tensor_batch['index'].tolist())
                 is_last_step = self.global_steps >= self.total_training_steps
                 # #仅仅执行5步
                 # is_last_step = self.global_steps >= 2
@@ -1016,6 +1019,8 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        print("after one batch record is: ")
+                        self.actor_rollout_wg.get_record()  
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1238,13 +1243,17 @@ class RayPPOTrainer:
                     self.actor_rollout_wg.dump_memory_snapshot(
                         tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
                     )
+        
+                gen_ratio = self.actor_rollout_wg.compute_executing_ratio(timing_raw['gen'], stage='generation')
+                for i in range(self.actor_rollout_wg.world_size):
+                    print(f"for rank {i} in actor_rollout, executing gen ratio = {gen_ratio[i]['generation']}")
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     pprint(f"TOTAL TIME: {time.time()-begin_timestamp:.4f} s")
                     progress_bar.close()
                     epoch_stats = self.actor_rollout_wg.get_record()  # 得到 {prompt_id: {layer_idx: [per-expert prob sums]}}
-                    with open(f"moe_step_{self.global_steps}.json", "w") as f:
+                    with open(f"moe_step_{epoch}.json", "w") as f:
                         json.dump(epoch_stats, f)
                     return
 
@@ -1258,4 +1267,4 @@ class RayPPOTrainer:
             epoch_stats = self.actor_rollout_wg.get_record()  # 得到 {prompt_id: {layer_idx: [per-expert prob sums]}}
             with open(f"moe_step_{epoch}.json", "w") as f:
                 json.dump(epoch_stats, f)
-            self.actor_rollout_wg.flush_record()
+            # self.actor_rollout_wg.flush_record()

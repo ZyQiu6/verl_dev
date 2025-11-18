@@ -88,6 +88,8 @@ from verl.utils.py_functional import convert_to_regular_types
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+#新增
+import time
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -264,6 +266,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+        
+        # record excuting time
+        self._time_dict_trace = {
+            'generation': 0,
+            'train': 0,
+            'inference': 0,
+            'sync': 0,
+        }
 
     def _build_model_optimizer(
         self,
@@ -843,6 +853,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
+        _begin_time = time.time()
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -881,11 +892,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        self._time_dict_trace['train'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
+        _begin_time = time.time()
         # Support all hardwares
         assert self._is_rollout
         prompts = prompts.to(get_device_id())
@@ -935,11 +948,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # clear kv cache
         get_torch_device().empty_cache()
+        self._time_dict_trace['generation'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
+        _begin_time = time.time()
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
@@ -976,11 +991,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
+        self._time_dict_trace['train'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
+        _begin_time = time.time()
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
@@ -1012,6 +1029,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             elif fsdp_version(self.ref_policy.actor_module) == 2:
                 self.ref_policy.actor_module.reshard()
 
+        self._time_dict_trace['inference'] += (time.time() - _begin_time)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1117,6 +1135,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def flush_record(self):
         return self.rollout.flush_record()
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def compute_executing_ratio(self, total_time, stage=None):
+        executing_ratio = {}
+        for key, value in self._time_dict_trace.items():
+            if (not stage) or stage in key:
+                executing_ratio[key] = round(value / total_time, 4)
+        self.reset_executing_time(stage)
+        return executing_ratio
+
+    def reset_executing_time(self, stage=None):
+        for key, value in self._time_dict_trace.items():
+            if (not stage) or stage in key:
+                self._time_dict_trace[key] = 0
 
 
 class CriticWorker(Worker, DistProfilerExtension):

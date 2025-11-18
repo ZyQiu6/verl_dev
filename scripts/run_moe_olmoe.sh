@@ -2,9 +2,9 @@
 export HYDRA_FULL_ERROR=1
 export VLLM_USE_V1=1
 export RAY_DEDUP_LOGS=0
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=2,3
 export HF_ENDPOINT=https://hf-mirror.com
-export VLLM_ALL2ALL_BACKEND=deepep_low_latency
+# export VLLM_ALL2ALL_BACKEND=deepep_low_latency
 export VLLM_MOE_STATS=1
 #export VLLM_MOE_DP_CHUNK_SIZE=128
 
@@ -41,10 +41,11 @@ python3 -m verl.trainer.main_ppo \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
-    trainer.project_name='verl_gsm8k_olmoechat_dpep' \
+    trainer.project_name='verl_gsm8k_olmoechat_bep2' \
     trainer.experiment_name='original' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
-    trainer.test_freq=5 \
-    trainer.total_epochs=10 $@ >> olmoe-record.txt
+    trainer.test_freq=-1 \
+    trainer.val_before_train=False \
+    trainer.total_epochs=3 $@ >> olmoe-record-debug.txt
