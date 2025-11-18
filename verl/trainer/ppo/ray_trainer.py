@@ -22,6 +22,7 @@ import json
 import os
 import uuid
 import time
+import matplotlib as plt
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -485,6 +486,25 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    def _plot_length(self, response_mask, dump_path):
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.png")
+        
+        response_length = response_mask.sum(dim=-1).numpy()
+        response_length_weight = np.zeros_like(response_length) + 1 / len(response_length)
+        plt.hist(response_length, bins=25, color='skyblue', weights=response_length_weight)
+        plt.title('Length distribution of rollout')
+        plt.xlabel('Length')
+        plt.ylabel('Frequency')
+        plt.savefig(filename)
+        plt.close()
+        
+        length_file = os.path.join(dump_path, f"length_{self.global_steps}.txt")
+        n = len(response_length)
+        with open(length_file, "w") as f:
+            for i in range(n):
+                f.write(str(response_length[i]) + "\n")
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1252,6 +1272,15 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                    
+                    # Log response length
+                    rollout_length_dir = self.config.trainer.get("rollout_length_dir", None)
+                    if rollout_length_dir:
+                        response_masks = batch.batch["response_mask"]
+                        self._plot_length(
+                            response_mask=response_masks,
+                            dump_path=rollout_length_dir,
+                        )
 
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
                         ray.get(ray_history_spec_tasks)
