@@ -360,6 +360,10 @@ class vLLMRollout(BaseRollout):
 
             input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
 
+        # used for history tree
+        non_tensor_batch['vllm_inputs'] = np.array([input_data["prompt_token_ids"] for input_data in vllm_inputs], 
+                                                    dtype=object)
+
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
