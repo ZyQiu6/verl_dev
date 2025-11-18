@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -1006,6 +1007,12 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        # HistoSpec
+        if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+            from vllm_ascend.spec_decode.global_module.prefix_tree import \
+                get_history_trees
+            self.history_rollout_trees = get_history_trees()
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1032,6 +1039,11 @@ class RayPPOTrainer:
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
 
+                # start history rollout tree server
+                if self.config.actor_rollout_ref.rollout.use_history_spec_decode and self.global_steps == 1:
+                    self.history_rollout_trees.run_server()
+                    time.sleep(3.0)
+
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
@@ -1043,6 +1055,9 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+
+                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        self.history_rollout_trees.stop_server()
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1198,6 +1213,32 @@ class RayPPOTrainer:
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
+                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        ray_history_spec_tasks = []
+                        with marked_timer("update_rollout_suffix_tree", timing_raw, color='navy'):
+                            metrics.update(self.history_rollout_trees.compute_metrics())
+                            for i in range(len(batch)):
+                                prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
+                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                ray_history_spec_tasks.append(self.history_rollout_trees.delete(prompt_id)) # clear the tree every epoch
+                                ray_history_spec_tasks.append(self.history_rollout_trees.add_tree(prompt_id)) # clear the tree every epoch
+                            ray.get(ray_history_spec_tasks)
+                            ray_history_spec_tasks.clear()
+                            for i in range(len(batch)):
+                                batch_item = batch[i]  # DataProtoItem
+                                token_level_scores = batch_item.batch["token_level_scores"]
+                                response = batch_item.batch["responses"].numpy().tolist()
+                                try:
+                                    response_length = response.index(self.tokenizer.pad_token_id)
+                                    response = response[:response_length]
+                                except Exception as e:
+                                    response = response
+                                prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
+                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                ray_history_spec_tasks.append(self.history_rollout_trees.tree_append_node(
+                                    prompt_id, response, token_level_scores.sum().item()))
+                            self.history_rollout_trees.run_server()
+
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
@@ -1211,6 +1252,9 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        ray.get(ray_history_spec_tasks)
 
                 # validate
                 if (

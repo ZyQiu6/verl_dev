@@ -213,6 +213,16 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
+        if self.config.use_history_spec_decode:
+            speculative_config = {
+                "method": "history_rollout",
+                "num_speculative_tokens": 5, # no use
+                "prompt_lookup_min": 2,
+                "prompt_lookup_max": 7,
+            }
+        else:
+            speculative_config = None
+
         compilation_config = {}
 
         cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
@@ -247,6 +257,7 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            speculative_config=speculative_config,
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,

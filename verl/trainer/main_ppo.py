@@ -73,6 +73,11 @@ def run_ppo(config, task_runner_class=None) -> None:
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
+    if config.actor_rollout_ref.rollout.use_history_spec_decode:
+        from vllm_ascend.spec_decode.global_module.prefix_tree import \
+            init_history_trees
+        init_history_trees()
+
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
 
