@@ -26,6 +26,10 @@ from typing import Any, Optional
 import numpy as np
 import psutil
 import torch
+try:
+    import torch_npu
+except ImportError:
+    print("Importing TORCH_NPU failed.")
 import torch.distributed
 import torch.distributed as dist
 from codetiming import Timer
