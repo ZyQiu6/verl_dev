@@ -121,11 +121,8 @@ class RolloutConfig(BaseConfig):
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2
+    pipeline_model_parallel_size: int = 1
     max_num_batched_tokens: int = 8192
-    #max_num_batched_tokens: int = 128
-    disable_cuda_graph: Optional[bool] = False  # 新增
-    enable_expert_parallel: bool = False
-    all2all_backend: Optional[str] = None  # 新增
 
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
@@ -133,8 +130,8 @@ class RolloutConfig(BaseConfig):
     val_kwargs: SamplingConfig = field(default_factory=SamplingConfig)
 
     max_model_len: Optional[int] = None
-    #max_num_seqs: int = 16
     max_num_seqs: int = 1024
+
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size: Optional[int] = None
     log_prob_micro_batch_size_per_gpu: Optional[int] = None
@@ -181,9 +178,17 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
 
+    use_history_spec_decode: bool = False
+
     def __post_init__(self):
         """Validate the rollout config"""
         if self.expert_parallel_size > 1:
             assert self.expert_parallel_size == (self.tensor_model_parallel_size * self.data_parallel_size), (
                 "expert_parallel_size must be equal to tensor_model_parallel_size * data_parallel_size"
             )
+
+        if self.pipeline_model_parallel_size > 1:
+            if self.name == "vllm" or self.name == "sglang":
+                raise NotImplementedError(
+                    f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
+                )

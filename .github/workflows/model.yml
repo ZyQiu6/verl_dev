@@ -66,6 +66,13 @@ concurrency:
 env:
   IMAGE: "verl-ci-cn-beijing.cr.volces.com/verlai/verl:app-verl0.5-transformers4.55.4-vllm0.10.0-mcore0.13.0-te2.2"
   DYNAMIC_RUNNER_ENDPOINT: "https://sd10g3clalm04ug7alq90.apigateway-cn-beijing.volceapi.com/runner"
+      - "tests/utils/gpu_tests/checkpoint/test_fsdp_ckpt.py"
+      - "tests/models/test_transformers_ulysses.py"
+      - "tests/distributed/run_all.sh"
+
+# Declare permissions just read content.
+permissions:
+  contents: read
 
 jobs:
   setup:
@@ -86,6 +93,7 @@ jobs:
   model_rmpad:
     needs: setup
     runs-on: ["${{ needs.setup.outputs.runner-label || 'L20x8' }}"]
+    runs-on: [L20x8]
     timeout-minutes: 20 # Increase this timeout value as needed
     env:
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
@@ -93,11 +101,15 @@ jobs:
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
+    container:
+      image: whatcanyousee/verl:ngc-cu124-vllm0.8.3-sglang0.4.5-mcore0.12.0-te2.2
+      options: --gpus all --shm-size=10g
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: Install the current repository and upgrade to latest transformers(4.54.0)/flash_attn, transformers 4.55.0 has strange behavior with model backward
+      - name: Install the current repository and upgrade to latest transformers/flash_attn
         run: |
           pip3 install --no-deps -e .[test]
           pip3 install --upgrade transformers
@@ -128,12 +140,44 @@ jobs:
       - name: Run distributed test
         run: |
           bash tests/special_distributed/run_all.sh
+          pip3 install --upgrade flash_attn --no-build-isolation
+          pytest -s tests/models/test_transformer.py
+      - name: Running FSDP rmpad model tests on 8 L20 GPUs + latest flash_attn
+        run: |
+          STRATEGY=fsdp torchrun --nproc_per_node=8 tests/utils/gpu_tests/checkpoint/test_fsdp_ckpt.py
+      - name: Running transformers ulysses tests on 8 L20 GPUs + latest transformers
+        run: |
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      - name: Running transformers ulysses tests on 8 L20 GPUs + transformers 4.49.0
+        run: |
+          pip3 install transformers==4.49.0
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      - name: Running transformers ulysses tests on 8 L20 GPUs + transformers 4.48.0
+        run: |
+          pip3 install transformers==4.48.0
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      - name: Running transformers ulysses tests on 8 L20 GPUs + transformers 4.47.0
+        run: |
+          pip3 install transformers==4.47.0
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      - name: Running transformers ulysses tests on 8 L20 GPUs + transformers 4.46.0
+        run: |
+          pip3 install transformers==4.46.0
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      - name: Running transformers ulysses tests on 8 L20 GPUs + transformers 4.45.0
+        run: |
+          pip3 install transformers==4.45.0
+          torchrun --nproc_per_node=8 -m pytest tests/models/test_transformers_ulysses.py
+      - name: Run distributed test
+        run: |
+          bash tests/distributed/run_all.sh
 
   # TODO: Move this back to model_rmpad once FSDP2 is stable.
   # NOTE: List as an independent job to make rerun easier.
   model_rmpad_fsdp2_unstable:
     needs: setup
     runs-on: [ "${{ needs.setup.outputs.runner-label || 'L20x8' }}" ]
+    runs-on: [L20x8]
     timeout-minutes: 20 # Increase this timeout value as needed
     env:
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
@@ -141,6 +185,9 @@ jobs:
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
+    container:
+      image: whatcanyousee/verl:ngc-cu124-vllm0.8.3-sglang0.4.5-mcore0.12.0-te2.2
+      options: --gpus all --shm-size=10g
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -228,3 +275,5 @@ jobs:
           mode: "destroy"
           faas-url: "${{ env.DYNAMIC_RUNNER_ENDPOINT }}"
           mlp-task-id: "${{ needs.setup.outputs.mlp-task-id }}"
+          pip3 install --upgrade flash_attn --no-build-isolation
+          STRATEGY=fsdp2 torchrun --nproc_per_node=8 tests/utils/gpu_tests/checkpoint/test_fsdp_ckpt.py

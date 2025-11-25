@@ -54,6 +54,8 @@ on:
       - "pyproject.toml"
       - "requirements-npu.txt"
       - "setup.py"
+      - "**/*.py"
+      - .github/workflows/e2e_ascend.yml
 
 # Cancel jobs on the same ref if a new one is triggered
 concurrency:
@@ -71,6 +73,11 @@ jobs:
     timeout-minutes: 40 # Increase this timeout value as needed
     container:
       image: crispig/verl_npu:cann8.1rc1-py3.10-torch2.5.1-vllm-ascend0.7.3.post1-mindspeed0121-250731
+    name: verl Ascend test (self-host)
+    runs-on: [self-hosted, npu-0]
+    timeout-minutes: 5 # Increase this timeout value as needed
+    container:
+      image: quay.io/ascend/cann:8.0.0-910b-ubuntu22.04-py3.10
       volumes:
         - /usr/local/dcmi:/usr/local/dcmi
         - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
@@ -95,6 +102,8 @@ jobs:
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
+        --privileged
+        --network "host"
     steps:
       - name: Check npu and CANN info
         run: |
@@ -154,3 +163,6 @@ jobs:
         run: |
           ray stop --force
           pytest -s -x tests/utils/test_special_mstx_profile.py
+      - name: Run test
+        run: |
+          lscpu

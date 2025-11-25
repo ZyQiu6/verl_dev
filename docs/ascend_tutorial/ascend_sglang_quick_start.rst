@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 verl x Ascend
+=======
+Ascend Quickstart with SGLang Backend
+>>>>>>> origin/npu
 ===================================
 
 Last updated: 09/25/2025.

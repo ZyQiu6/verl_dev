@@ -73,11 +73,17 @@ on:
       - ".github/workflows/e2e_dapo.yml"
       - "examples/data_preprocess/gsm8k.py"
       - "tests/special_e2e/run_dapo.sh"
+      - "recipe/dapo/src"
+      # Entrypoints
+      - ".github/workflows/e2e_dapo.yml"
+      - "examples/data_preprocess/gsm8k.py"
+      - "tests/e2e/run_dapo.sh"
 
 # Cancel jobs on the same ref if a new one is triggered
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 
 # Declare permissions just read content.
 permissions:
@@ -106,6 +112,9 @@ jobs:
   e2e_dapo:
     needs: setup
     runs-on: [ "${{ needs.setup.outputs.runner-label || 'L20x8' }}" ]
+jobs:
+  e2e_dapo:
+    runs-on: [L20x8]
     timeout-minutes: 40 # Increase this timeout value as needed
     env:
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
@@ -113,6 +122,9 @@ jobs:
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
+    container:
+      image: whatcanyousee/verl:ngc-cu124-vllm0.8.3-sglang0.4.5-mcore0.12.0-te2.2
+      options: --gpus all --shm-size=10g
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -143,3 +155,8 @@ jobs:
           mode: "destroy"
           faas-url: "${{ env.DYNAMIC_RUNNER_ENDPOINT }}"
           mlp-task-id: "${{ needs.setup.outputs.mlp-task-id }}"
+          python3 examples/data_preprocess/gsm8k.py
+      - name: Running the E2E test with the DAPO algorithm
+        run: |
+          ray stop --force
+          bash tests/e2e/run_dapo.sh

@@ -33,6 +33,10 @@ name: sgl
 
 on:
 #  workflow_dispatch: # Manual
+name: sgl
+
+on:
+  workflow_dispatch: # Manual
   # Trigger the workflow on push or pull request,
   # but only for the main branch
   push:
@@ -46,6 +50,14 @@ on:
     branches:
       - main
       - v0.*
+      - v0.2.x
+    paths:
+      - "**/*.py"
+      - .github/workflows/vllm.yml
+  pull_request:
+    branches:
+      - main
+      - v0.2.x
     paths:
       - "**/*.py"
       # Other entrypoints
@@ -100,6 +112,10 @@ jobs:
     needs: setup
     runs-on: ["${{ needs.setup.outputs.runner-label || 'L20x8' }}"]
     timeout-minutes: 35 # Increase this timeout value as needed
+jobs:
+  sgl:
+    runs-on: [L20x8]
+    timeout-minutes: 20 # Increase this timeout value as needed
     env:
       HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
@@ -109,6 +125,9 @@ jobs:
       SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK: "True"
       NCCL_SHM_DISABLE: "1"
       NCCL_P2P_DISABLE: "1"
+    container:
+      image: ocss884/verl-sglang:ngc-th2.6.0-cu126-sglang0.4.6.post1
+      options: --gpus all --shm-size=10g
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -143,6 +162,16 @@ jobs:
         run: |
           cd tests/workers/rollout
           torchrun --nnodes=1 --nproc_per_node=2 $(which pytest) -s test_sglang_multi_interaction.py
+          pip3 install hf_transfer
+          pip3 install -e .[test,gpu,sglang] --no-deps
+      - name: Test the latest SGLang
+        run: |
+          cd tests/workers/rollout
+          torchrun --nnodes=1 --nproc_per_node=4 $(which pytest) -s test_sglang_spmd.py
+      - name: Test the latest SGLang async
+        run: |
+          cd tests/workers/rollout
+          torchrun --nnodes=1 --nproc_per_node=2 $(which pytest) -s test_sglang_async_spmd.py
       - name: Test the latest SGLang Rollout async with tool
         run: |
           cd tests/workers/rollout

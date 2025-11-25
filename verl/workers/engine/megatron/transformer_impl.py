@@ -28,6 +28,7 @@ from verl.models.mcore import get_mcore_weight_converter
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
+from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
@@ -85,7 +86,6 @@ class MegatronEngine(BaseEngine):
             tensor_model_parallel_size=self.engine_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=self.engine_config.pipeline_model_parallel_size,
             virtual_pipeline_model_parallel_size=self.engine_config.virtual_pipeline_model_parallel_size,
-            pipeline_model_parallel_split_rank=None,
             use_sharp=False,
             context_parallel_size=self.engine_config.context_parallel_size,
             expert_model_parallel_size=self.engine_config.expert_model_parallel_size,
@@ -380,6 +380,15 @@ class MegatronEngine(BaseEngine):
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
+
+        # compute num_tokens in global batch for loss normalization
+        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+        torch.distributed.all_reduce(
+            batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+        )
+        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+        tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
         if vpp_size is not None and vpp_size > 1:
             num_batches_divided_by = self.tf_config.microbatch_group_size_per_vp_stage
@@ -512,11 +521,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
         batch = batch.to(get_device_id())
         batch = batch.contiguous()
         input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"].to(bool)
+        loss_mask = batch["loss_mask"].to(bool)
         position_ids = batch["position_ids"]
 
         # process vlm inputs
-        batch["attention_mask"] = batch["attention_mask"].to(bool)
         has_multi_modal_inputs = "multi_modal_inputs" in batch.keys()
         if has_multi_modal_inputs:
             batch["multi_modal_inputs"] = batch["multi_modal_inputs"]
@@ -538,20 +546,18 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
         return {
             "input_ids": input_ids,
-            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
             "position_ids": position_ids,
             "multi_modal_inputs": multi_modal_inputs,
         }
 
     def prepare_model_outputs(self, output: dict, data: TensorDict):
         calculate_entropy = tu.get_non_tensor_data(data, key="calculate_entropy", default=False)
-        responses = data["responses"]
-        response_length = responses.size(1)
 
-        log_prob = output["log_probs"][:, -response_length - 1 : -1].contiguous()
+        log_prob = output["log_probs"]
         model_output = {"log_probs": log_prob}
         if calculate_entropy:
-            entropy = output["entropy"][:, -response_length - 1 : -1].contiguous()
+            entropy = output["entropy"]
             model_output["entropy"] = entropy
 
         return model_output
@@ -561,74 +567,64 @@ class MegatronEngineWithLMHead(MegatronEngine):
         batch = batch.to(get_device_id())
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
+        pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         temperature = batch["temperature"]
 
         model_inputs = self.prepare_model_inputs(batch)
         input_ids = model_inputs["input_ids"]
-        attention_mask = model_inputs["attention_mask"]
-        position_ids = model_inputs["position_ids"]
         multi_modal_inputs = model_inputs["multi_modal_inputs"]
 
-        responses = batch["responses"]
-        response_length = responses.size(1)
-        label = position_ids.clone()
-        label[:, -response_length - 1 : -1] = responses
-        label_mask = attention_mask.clone()
-        label_mask[:, : -response_length - 1] = False
-        label_mask[:, -1] = False
+        if pad_mode == DatasetPadMode.NO_PADDING:
+            label = input_ids.clone()
+        else:
+            raise NotImplementedError(f"Pad mode {pad_mode} is not supported for megatron engine")
 
-        from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn
+        from verl.models.mcore import get_mcore_forward_no_padding_fn
 
         if use_fused_kernels:
-            forward_fn = get_mcore_forward_fused_fn(self.model_config.hf_config)
-            # return dict of [logits, entropy]
-            output = forward_fn(
-                model,
-                input_ids,
-                position_ids,
-                attention_mask,
-                sequence_parallel=self.tf_config.sequence_parallel,
-                multi_modal_inputs=multi_modal_inputs,
-                labels=label,
-                labels_mask=label_mask,
-                temperature=temperature,
-            )
-        else:
-            forward_fn = get_mcore_forward_fn(self.model_config.hf_config)
+            raise NotImplementedError("Fused kernels are not supported for megatron engine")
 
-            def logits_processor(logits, label, label_mask):
-                assert logits.shape[:2] == label.shape[:2]
-                assert label.shape == label_mask.shape
-                logits.div_(temperature)
-                ret = {}
-                if calculate_entropy:
-                    logits_bak = logits.clone()
-                    if torch.distributed.get_rank() == 0:
-                        logger.warning_once(
-                            "For memory-efficient computation, enable fused kernels via "
-                            "`actor_rollout_ref.model.use_fused_kernels=True`. "
-                            "The current `clone()` operation ensures correctness but increases memory usage."
-                        )
-                    entropy = vocab_parallel_entropy(logits)
-                    ret["entropy"] = entropy
-                else:
-                    logits_bak = logits
-                log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
-                log_probs = log_probs.masked_fill(~label_mask, 0.0)
-                ret["log_probs"] = log_probs
-                return ret
+        forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
 
-            logits_processor_args = {"label": label, "label_mask": label_mask}
-            output = forward_fn(
-                model,
-                input_ids,
-                attention_mask,
-                position_ids,
-                sequence_parallel=self.tf_config.sequence_parallel,
-                multi_modal_inputs=multi_modal_inputs,
-                logits_processor=logits_processor,
-                logits_processor_args=logits_processor_args,
-            )
+        def logits_processor(logits, label):
+            assert logits.shape[:2] == label.shape[:2]
+            logits.div_(temperature)
+            ret = {}
+            if calculate_entropy:
+                logits_bak = logits.clone()
+                if torch.distributed.get_rank() == 0:
+                    logger.warning_once(
+                        "For memory-efficient computation, enable fused kernels via "
+                        "`actor_rollout_ref.model.use_fused_kernels=True`. "
+                        "The current `clone()` operation ensures correctness but increases memory usage."
+                    )
+                entropy = vocab_parallel_entropy(logits)
+                ret["entropy"] = entropy
+            else:
+                logits_bak = logits
+
+            # Create the final labels for next-token prediction.
+            # The `label` tensor starts as a clone of `input_ids`. `torch.roll` is not applied
+            # earlier because `input_ids` is a nested tensor, which is incompatible with the operation.
+            # The `preprocess_packed_seqs_no_padding` function unnests and flattens the tensor
+            # into `input_ids_rmpad` (shape: [1, total_seqlen]).
+            # Now, on this simple, unpadded tensor, we can perform the standard left shift
+            # to align the target token `t+1` with the prediction for token `t`.
+            label = torch.roll(label, shifts=-1, dims=1)
+
+            log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
+            ret["log_probs"] = log_probs
+            return ret
+
+        logits_processor_args = {"label": label}
+
+        output = forward_fn(
+            model,
+            input_ids,
+            multi_modal_inputs,
+            logits_processor=logits_processor,
+            logits_processor_args=logits_processor_args,
+        )
 
         return output, partial(postprocess_micro_batch_func, data=batch)
 
@@ -636,18 +632,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
         # For memory efficiency
         # We move calculation of entropy to compute_log_probs, forward_only == True
         device = data["input_ids"].device
-        local_micro_bsz = data["input_ids"].shape[0]
         model_output = self.prepare_model_outputs(output, data)
 
         if loss_function is not None:
             loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
             # scale loss by num_micro_batch because megatron will scale loss
             # by n_micro_batch and cp size inside pp schedule
-            n_micro_batch = data["num_micro_batch"]
-            loss = loss * n_micro_batch / mpu.get_context_parallel_world_size()
-            global_bsz = data["global_batch_size"]
-            loss_scale_factor = local_micro_bsz / (global_bsz / self.get_data_parallel_size())
-            loss = loss * loss_scale_factor
+            loss = loss * data["num_micro_batch"] / mpu.get_context_parallel_world_size()
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=device)
@@ -671,28 +662,20 @@ class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
         batch = batch.to(get_device_id())
         model_inputs = self.prepare_model_inputs(batch)
         input_ids = model_inputs["input_ids"]
-        attention_mask = model_inputs["attention_mask"]
-        position_ids = model_inputs["position_ids"]
         multi_modal_inputs = model_inputs["multi_modal_inputs"]
 
-        from verl.models.mcore import get_mcore_forward_fn
+        from verl.models.mcore import get_mcore_forward_no_padding_fn
 
-        forward_fn = get_mcore_forward_fn(self.model_config.hf_config)
+        forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
 
         output = forward_fn(
             model,
             input_ids,
-            attention_mask,
-            position_ids,
-            sequence_parallel=self.tf_config.sequence_parallel,
-            multi_modal_inputs=multi_modal_inputs,
+            multi_modal_inputs,
             value_model=True,
         )
 
         return output, partial(postprocess_micro_batch_func, data=batch)
 
     def prepare_model_outputs(self, output: dict | torch.Tensor, data: TensorDict):
-        responses = data["responses"]
-        response_length = responses.size(1)
-        output = output[:, -response_length - 1 : -1].contiguous()
         return {"values": output}

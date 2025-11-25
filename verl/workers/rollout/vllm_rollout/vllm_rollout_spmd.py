@@ -31,7 +31,6 @@ import inspect
 import logging
 import os
 import pickle
-import socket
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -49,8 +48,18 @@ from omegaconf import ListConfig
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
-from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
+from vllm.config import CompilationConfig, LoRAConfig
 from vllm.lora.request import LoRARequest
+
+try:
+    # https://github.com/vllm-project/vllm/commit/96b9aa5aa076e64c68765232aec343e4d0006e2a
+    from vllm.config import CompilationMode
+
+    _use_compilation_mode = True
+except ImportError:
+    from vllm.config import CompilationLevel
+
+    _use_compilation_mode = False
 
 try:
     from vllm.worker.worker_base import WorkerWrapperBase
@@ -58,19 +67,26 @@ except ModuleNotFoundError:
     # https://github.com/vllm-project/vllm/commit/6a113d9aed8221a9c234535958e70e34ab6cac5b
     from vllm.v1.worker.worker_base import WorkerWrapperBase
 
+from packaging import version as vs
+
 from verl import DataProto
-from verl.third_party.vllm import VLLM_SLEEP_LEVEL
+from verl.third_party.vllm import VLLM_SLEEP_LEVEL, get_version
 from verl.utils.device import is_npu_available
 from verl.utils.distributed import initialize_global_process_group_ray
+from verl.utils.model import get_lora_rank_from_adapter
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.ray_utils import ray_noset_visible_devices
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
-#new wj import
-import copy
-from vllm.utils.moe_stats import moe_stats
+from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
+from verl.workers.rollout.vllm_rollout.utils import (
+    VLLM_LORA_INT_ID,
+    VLLM_LORA_NAME,
+    VLLM_LORA_PATH,
+    get_vllm_max_lora_rank,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -94,41 +110,16 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> list[in
 if is_version_ge(pkg="vllm", minver="0.7.3"):
     VLLMHijack.hijack()
 
-def _merge_engine_kwargs(model_path, tensor_parallel_size,
-                         config, max_model_len, load_format,
-                         max_num_batched_tokens, trust_remote_code,
-                         compilation_config, lora_kwargs, engine_kwargs):
-    """把初始化时用到的所有参数合成一个 dict 并返回。"""
-    base = {
-        "model": model_path,
-        "enable_sleep_mode": config.free_cache_engine,
-        "tensor_parallel_size": int(tensor_parallel_size),
-        "distributed_executor_backend": "external_launcher",
-        "dtype": config.dtype,
-        "enforce_eager": config.enforce_eager,
-        "gpu_memory_utilization": config.gpu_memory_utilization,
-        "disable_custom_all_reduce": True,
-        "skip_tokenizer_init": False,
-        "max_model_len": max_model_len,
-        "max_num_seqs": config.max_num_seqs,
-        "load_format": load_format,
-        "disable_log_stats": config.disable_log_stats,
-        "max_num_batched_tokens": max_num_batched_tokens,
-        "enable_chunked_prefill": config.enable_chunked_prefill,
-        "enable_prefix_caching": config.enable_prefix_caching,
-        "trust_remote_code": trust_remote_code,
-        "enable_expert_parallel": config.enable_expert_parallel,
-        "data_parallel_size": config.data_parallel_size,
-        "seed": config.get("seed", 0),
-    }
-    # 合并可选的额外参数（后合并的可覆盖前面的同名键）
-    base.update(compilation_config or {})
-    base.update(lora_kwargs or {})
-    base.update(engine_kwargs or {})
 
-    # 清理 None 值，避免把“未设置”的参数硬塞给 LLM
-    base = {k: v for k, v in base.items() if v is not None}
-    return base
+def _check_vllm_version_for_sleep_level():
+    # https://github.com/vllm-project/vllm/issues/25171
+    minver = "0.11.0"
+    current_version = get_version("vllm")
+    if not current_version:
+        logger.warning("Could not determine vLLM version, assuming an older version for sleep_level configuration.")
+        return False
+    return vs.parse(current_version) >= vs.parse(minver)
+
 
 class vLLMRollout(BaseRollout):
     def __init__(
@@ -148,8 +139,15 @@ class vLLMRollout(BaseRollout):
         tokenizer = model_config.tokenizer
         model_hf_config = model_config.hf_config
         trust_remote_code = model_config.trust_remote_code
+
+        lora_adapter_path = getattr(model_config, "lora_adapter_path", None)
+        if lora_adapter_path is not None:
+            lora_rank = get_lora_rank_from_adapter(lora_adapter_path)
+        else:
+            lora_rank = model_config.lora_rank
+
         self.lora_kwargs = (
-            {"enable_lora": True, "max_loras": 1, "max_lora_rank": model_config.lora_rank}
+            {"enable_lora": True, "max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(lora_rank)}
             if model_config.lora_rank > 0
             else {}
         )
@@ -214,6 +212,52 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
+        if self.config.use_history_spec_decode:
+            speculative_config = {
+                "method": "history_rollout",
+                "num_speculative_tokens": 5, # no use
+                "prompt_lookup_min": 2,
+                "prompt_lookup_max": 7,
+            }
+        else:
+            speculative_config = None
+
+        compilation_config = {}
+
+        cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
+        # enforce_eager must be False to use cudagraph
+        if not config.enforce_eager and cudagraph_capture_sizes:
+            if isinstance(cudagraph_capture_sizes, ListConfig):
+                compilation_args = {"cudagraph_capture_sizes": cudagraph_capture_sizes}
+                if _use_compilation_mode:
+                    compilation_args["mode"] = CompilationMode.VLLM_COMPILE
+                else:
+                    compilation_args["level"] = CompilationLevel.PIECEWISE
+                compilation_config["compilation_config"] = CompilationConfig(**compilation_args)
+            else:
+                logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
+
+        max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
+
+        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+            raise ValueError(
+                "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
+                             please increase max_num_batched_tokens or disable chunked prefill"
+            )
+
+        load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+
+        # copy it to avoid secretly modifying the engine config
+        engine_kwargs = config.get("engine_kwargs", {}).get("vllm", {}) or {}
+
+        # For each vLLM engine parameter,
+        # - `None` means not setting it, so we pop it, and leave it to vLLM default value
+        #    (which can vary across different vLLM versions);
+        # - Otherwise it's the desired value we want to explicitly set.
+        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        if config.get("limit_images", None):  # support for multi-image data
+            engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
+
         compilation_config = {}
 
         cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
@@ -250,14 +294,12 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
-            enable_expert_parallel=config.enable_expert_parallel,
-            data_parallel_size=config.data_parallel_size,
             seed=config.get("seed", 0),
+            speculative_config=speculative_config,
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,
         )
-        self._engine_kwargs = _merge_engine_kwargs(model_path, tensor_parallel_size, config, max_model_len, load_format,max_num_batched_tokens, trust_remote_code,compilation_config, self.lora_kwargs, engine_kwargs,)
         kwargs = dict(
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
@@ -293,39 +335,6 @@ class vLLMRollout(BaseRollout):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
 
-    def _hard_reset_vllm(self):
-        # 1) 停旧引擎
-        if getattr(self, "inference_engine", None) is not None:
-            try:
-                # 新版本引擎：有 llm_engine，可调用 shutdown()
-                if hasattr(self.inference_engine, "llm_engine"):
-                    try:
-                        self.inference_engine.llm_engine.shutdown()
-                    except Exception:
-                        pass
-            finally:
-                self.inference_engine = None
-
-        # 2) 销毁 vLLM 的并行/通信环境（关键！）
-        try:
-            from vllm.distributed.parallel_state import (
-                destroy_model_parallel, destroy_distributed_environment
-            )
-            destroy_model_parallel()
-            #destroy_distributed_environment()
-        except Exception as e:
-            print(f"[warn] destroy parallel_state failed: {e}")
-
-        # 3) 等待、清显存
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-    def _pin_cuda_device_before_llm(self) -> None:
-        # 任何分布式/PG/LLM重构之前都要先绑卡
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        _ = torch.empty(1, device="cuda")  # 让 NCCL/PG 看到当前 device
-
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
@@ -349,60 +358,6 @@ class vLLMRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
-        #change parallism method
-        change = prompts.meta_info.pop("change_parallism_method", None)
-        if change:
-            begin = time.time()
-            #rebuild generation model
-            # 1) 阻塞式屏障（可选）：避免与其他并发请求交错
-            try:
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    torch.distributed.barrier()
-            except Exception:
-                pass
-             # 2) 关闭旧引擎（AsyncLLMEngine 需要 shutdown；LLM 直接释放即可）
-            try:
-                if hasattr(self, "inference_engine") and self.inference_engine is not None:
-                    if hasattr(self.inference_engine, "shutdown"):
-                        # vLLM 异步引擎需要显式 shutdown 释放后台循环/显存
-                        self.inference_engine.shutdown()   # 参考官方 API
-                    # 释放对象引用
-                    del self.inference_engine
-            finally:
-                # 清理显存
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-            # 3) 组装新的引擎，最简单实现直接给出配置,TP
-            new_kwargs = copy.deepcopy(self._engine_kwargs)
-            new_kwargs["tensor_parallel_size"] = 4
-            new_kwargs["enable_expert_parallel"] = False
-            new_kwargs["data_parallel_size"] = 1
-            self._hard_reset_vllm()
-            print("distributed environment is initialized?",torch.distributed.is_initialized())
-            self.inference_engine = LLM(**new_kwargs)
-            # 4) 通过 ShardingManager 同步“最新权重”
-            try:
-                sm = getattr(self, "rollout_sharding_manager", None)
-                if sm is not None:
-                    # 进入上下文通常会完成从 Actor → Rollout 的一次权重材质化与布局转换
-                    with sm:
-                        pass
-            except Exception as e:
-                # 不影响后续生成；必要时在这里加你的告警/日志
-                print(f"[warn] weight sync via ShardingManager failed: {e}")
-            print("successfully change vllm parallism methed")
-
-            # 5) （可选）再次屏障，确保所有 rank 都完成了重构
-            try:
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    torch.distributed.barrier()
-            except Exception:
-                pass
-            end = time.time()
-            print(f"time for change vllm parallism method: {end-begin} s")
-
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         # left-padded attention_mask
         attention_mask = prompts.batch["attention_mask"]
@@ -441,6 +396,10 @@ class vLLMRollout(BaseRollout):
                 )
 
             input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
+
+        # used for history tree
+        non_tensor_batch['vllm_inputs'] = np.array([input_data["prompt_token_ids"] for input_data in vllm_inputs], 
+                                                    dtype=object)
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
@@ -537,10 +496,6 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
-        
-        # #after one batch, show record
-        # print("MoE Stats in vllm")
-        # moe_stats.snapshot()
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
@@ -591,12 +546,6 @@ class vLLMRollout(BaseRollout):
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
             model.load_weights(weights)
-        ###new wj
-    def get_record(self):
-        return moe_stats.snapshot()
-    
-    def flush_record(self):
-        return moe_stats.reset_epoch()
 
 
 # https://github.com/vllm-project/vllm/issues/13175
@@ -629,11 +578,13 @@ class vLLMAsyncRollout(BaseRollout):
         self.inference_engine: WorkerWrapperBase = None
         self.address = self._init_zeromq()
         self.lora_config = (
-            {"max_loras": 1, "max_lora_rank": model_config.lora_rank} if model_config.lora_rank > 0 else {}
+            {"max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(model_config.lora_rank)}
+            if model_config.lora_rank > 0
+            else {}
         )
 
-        # https://github.com/vllm-project/vllm/issues/25171
-        if config.layered_summon or config.expert_parallel_size > 1:
+        if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
+            logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
             self.sleep_level = 1
         else:
             self.sleep_level = VLLM_SLEEP_LEVEL
@@ -647,27 +598,25 @@ class vLLMAsyncRollout(BaseRollout):
 
         # File lock to prevent multiple workers listen to same port
         with FileLock(f"/tmp/verl_vllm_zmq_{getpass.getuser()}.lock"):
+            context = zmq.asyncio.Context()
+            self.socket = context.socket(zmq.REP)
             if socket_type == "ipc":
                 pid = os.getpid()
                 address = f"ipc:///tmp/verl_vllm_zmq_{pid}_{getpass.getuser()}.ipc"
             else:
-                ip, port = self._get_free_port()
-                address = f"tcp://{ip}:{port}"
-            context = zmq.asyncio.Context()
-            self.socket = context.socket(zmq.REP)
+                ip = ray.util.get_node_ip_address().strip("[]")
+                port, sock = get_free_port(ip)
+                if is_valid_ipv6_address(ip):
+                    address = f"tcp://[{ip}]:{port}"
+                    self.socket.setsockopt(zmq.IPV6, 1)
+                else:
+                    address = f"tcp://{ip}:{port}"
             self.socket.bind(address)
 
         loop = asyncio.get_running_loop()
         self.zmq_loop_task = loop.create_task(self._loop_forever())
 
         return address
-
-    def _get_free_port(self):
-        ip = ray.util.get_node_ip_address()
-        with socket.socket() as sock:
-            sock.bind(("", 0))
-            port = sock.getsockname()[1]
-        return ip, port
 
     async def _loop_forever(self):
         while True:
@@ -678,7 +627,8 @@ class vLLMAsyncRollout(BaseRollout):
                 await self.socket.send(pickle.dumps(result))
             except Exception as e:
                 logger.exception(f"vLLMAsyncRollout _loop_forever error: {e}")
-                os._exit(-1)
+                await self.socket.send(pickle.dumps(e))
+                break
 
     def _init_worker(self, all_kwargs: list[dict[str, Any]]):
         """Initialize worker engine."""
@@ -734,15 +684,16 @@ class vLLMAsyncRollout(BaseRollout):
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
-            lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
-            lora_reqest = TensorLoRARequest(
-                lora_name=f"{lora_int_id}",
-                lora_int_id=lora_int_id,
-                lora_path="simon_lora_path",
+            # In async mode, make sure the old lora is removed before adding the new one
+            self.inference_engine.worker.remove_lora(VLLM_LORA_INT_ID)
+            lora_request = TensorLoRARequest(
+                lora_name=VLLM_LORA_NAME,
+                lora_int_id=VLLM_LORA_INT_ID,
+                lora_path=VLLM_LORA_PATH,
                 peft_config=asdict(peft_config),
                 lora_tensors=dict(weights),
             )
-            self.inference_engine.worker.add_lora(lora_reqest)
+            self.inference_engine.worker.add_lora(lora_request)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
@@ -759,4 +710,3 @@ class vLLMAsyncRollout(BaseRollout):
 
     def get_zeromq_address(self):
         return self.address
-    

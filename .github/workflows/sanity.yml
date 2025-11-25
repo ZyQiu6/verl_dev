@@ -57,6 +57,15 @@ concurrency:
 permissions:
   contents: read
 
+# Cancel jobs on the same ref if a new one is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Declare permissions just read content.
+permissions:
+  contents: read
+
 jobs:
   sanity:
     runs-on: ubuntu-latest
@@ -81,6 +90,10 @@ jobs:
       - name: Run license test
         run: |
           python3 tests/special_sanity/check_license.py --directories .
+          pytest -s -x tests/sanity
+      - name: Run license test
+        run: |
+          python3 tests/sanity/check_license.py --directory .
       - name: Assert naming convention
         run: |
           if grep -rIn --exclude-dir=.git --exclude-dir=.github --exclude-dir=venv --exclude-dir=__pycache__ 'veRL' .; then
