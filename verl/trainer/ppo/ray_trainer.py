@@ -22,7 +22,7 @@ import json
 import os
 import uuid
 import time
-import matplotlib as plt
+import matplotlib.pyplot as plt
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
