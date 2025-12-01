@@ -26,6 +26,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Optional
+import matplotlib.pyplot as plt 
 
 import numpy as np
 import ray
@@ -477,6 +478,24 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+    def _plot_length(self, response_mask, dump_path):
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.png")
+        
+        response_length = response_mask.sum(dim=-1).numpy()
+        response_length_weight = np.zeros_like(response_length) + 1 / len(response_length)
+        plt.hist(response_length, bins=25, color='skyblue', weights=response_length_weight)
+        plt.title('Length distribution of rollout')
+        plt.xlabel('Length')
+        plt.ylabel('Frequency')
+        plt.savefig(filename)
+        plt.close()
+        
+        length_file = os.path.join(dump_path, f"length_{self.global_steps}.txt")
+        n = len(response_length)
+        with open(length_file, "w") as f:
+            for i in range(n):
+                f.write(str(response_length[i]) + "\n")
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -947,13 +966,13 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
+        # if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        #     val_metrics = self._validate()
+        #     assert val_metrics, f"{val_metrics=}"
+        #     pprint(f"Initial validation metrics: {val_metrics}")
+        #     logger.log(data=val_metrics, step=self.global_steps)
+        #     if self.config.trainer.get("val_only", False):
+        #         return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
@@ -979,6 +998,8 @@ class RayPPOTrainer:
         for epoch in range(self.config.trainer.total_epochs):
             #正式训练前，清空记录
             self.actor_rollout_wg.flush_record()
+            #清空长尾标记
+            self.actor_rollout_wg.set_tail_mode(False)
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -1021,7 +1042,6 @@ class RayPPOTrainer:
                         gen_batch_output.meta_info.pop("timing", None)
                         print("after one batch record is: ")
                         self.actor_rollout_wg.get_record()  
-
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
@@ -1157,6 +1177,15 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                    
+                    # Log response length
+                    rollout_length_dir = self.config.trainer.get("rollout_length_dir", None)
+                    if rollout_length_dir:
+                        response_masks = batch.batch["response_mask"]
+                        self._plot_length(
+                            response_mask=response_masks,
+                            dump_path=rollout_length_dir,
+                        )
 
                 # validate
                 if (
@@ -1245,8 +1274,8 @@ class RayPPOTrainer:
                     )
         
                 gen_ratio = self.actor_rollout_wg.compute_executing_ratio(timing_raw['gen'], stage='generation')
-                for i in range(self.actor_rollout_wg.world_size):
-                    print(f"for rank {i} in actor_rollout, executing gen ratio = {gen_ratio[i]['generation']}")
+                # for i in range(self.actor_rollout_wg.world_size):
+                #     print(f"for rank {i} in actor_rollout, executing gen ratio = {gen_ratio[i]['generation']}")
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")

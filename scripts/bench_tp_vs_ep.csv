@@ -1,0 +1,3 @@
+mode,batch_size,tokens_per_step,avg_new_tokens,avg_latency_sec,tokens_per_sec
+TP,1,1,8192,276.7956239382426,29.595843617194475
+EP,1,1,8192,287.18741877873737,28.5249264568637

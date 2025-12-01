@@ -2,15 +2,17 @@
 export HYDRA_FULL_ERROR=1
 export VLLM_USE_V1=1
 export RAY_DEDUP_LOGS=0
-export CUDA_VISIBLE_DEVICES=2,3
 export HF_ENDPOINT=https://hf-mirror.com
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 # export VLLM_ALL2ALL_BACKEND=deepep_low_latency
 export VLLM_MOE_STATS=1
-export ASCEND_GLOBAL_LOG_LEVEL=0
-export ASCEND_SLOG_PRINT_TO_STDOUT=1
+export HCCL_BUFFSIZE=500
+# export ASCEND_GLOBAL_LOG_LEVEL=0
+# export ASCEND_SLOG_PRINT_TO_STDOUT=1
 #export VLLM_MOE_DP_CHUNK_SIZE=128
 #tp需要设置以下：
 # export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+# allenai/OLMoE-1B-7B-0924-Instruct
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=/root/verl_dev/data/gsm8k/train.parquet \

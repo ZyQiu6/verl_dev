@@ -27,6 +27,10 @@ from typing import Any, Optional
 import numpy as np
 import psutil
 import torch
+try:
+    import torch_npu
+except ImportError:
+    print("Importing TORCH_NPU failed.")
 import torch.distributed
 import torch.distributed as dist
 from codetiming import Timer
@@ -85,6 +89,7 @@ from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
+from verl.utils.ray_utils import get_event_loop
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
@@ -275,6 +280,50 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             'sync': 0,
         }
 
+        #配置长尾检测
+        rollout_cfg = self.config.rollout
+        # 响应长度 max / mean 的阈值，比如 max_len > 2 * mean_len 视为长尾
+        self.tail_len_ratio_threshold = rollout_cfg.get(
+            "tail_len_ratio_threshold", 2.0
+        )
+        # 记录当前是否在 tail 模式，用于去抖
+        self._in_tail_mode = False
+
+    def _detect_long_tail_from_output(self, output: DataProto) -> bool:
+        """
+        最简版本：用 response 长度的 max / mean 判断是否存在长尾。
+        注意：这里的字段名你要按自己 DataProto 的实际情况改。
+        """
+
+        batch = output.batch  # TensorDict
+
+        # 下面是一个示例字段名写法：
+        #   - 如果你在 DataProto 里已经有 response_lens，直接用它；
+        #   - 否则可以用 response_ids 或 response_attention_mask 自己算。
+        if "response_lens" in batch.keys():
+            seq_lens = batch["response_lens"].to(torch.float32)        # [B]
+        elif "response_attention_mask" in batch.keys():
+            # attention_mask: 1 表示有效 token
+            mask = batch["response_attention_mask"]                     # [B, T]
+            seq_lens = mask.to(torch.float32).sum(dim=-1)               # [B]
+        else:
+            # 兜底：假设有 response_ids，pad_token_id 用 tokenizer 里的
+            resp_ids = batch["response_ids"]                            # [B, T]
+            pad_id = getattr(self, "pad_token_id", 0)
+            seq_lens = resp_ids.ne(pad_id).to(torch.float32).sum(dim=-1)
+
+        if seq_lens.numel() == 0:
+            return False
+
+        max_len = seq_lens.max().item()
+        mean_len = seq_lens.mean().item()
+
+        len_ratio = max_len / (mean_len + 1e-6)
+        is_tail = len_ratio >= self.tail_len_ratio_threshold
+
+        return is_tail
+
+
     def _build_model_optimizer(
         self,
         model_path,
@@ -324,9 +373,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
+        attn_implementation = override_model_config.get("attn_implementation", "eager")
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+            local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
@@ -338,6 +388,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if getattr(actor_model_config, "model_type", None) == "kimi_vl":
             actor_model_config.text_config.topk_method = "greedy"
 
+
+        
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
         override_config_kwargs = {
@@ -581,6 +633,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 2. build rollout device mesh
         infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
+        #infer_tp实际代表了tp*dp的总和
         dp = self.world_size // infer_tp
         assert self.world_size % infer_tp == 0, (
             f"rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}"
@@ -612,7 +665,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
-        # Full params
+        # # Full params
         if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
             FSDP.set_state_dict_type(
                 self.actor_module_fsdp,
@@ -635,7 +688,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # For sync mode, we directly switch to trainer mode here.
         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
         if rollout_config.mode == "sync" and self._is_actor:
-            loop = asyncio.get_event_loop()
+            loop = get_event_loop()
             loop.run_until_complete(self.trainer_mode())
 
     async def rollout_mode(self):
@@ -643,6 +696,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
 
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
+        #用于无训练版本
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
@@ -902,7 +956,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         assert self._is_rollout
         prompts = prompts.to(get_device_id())
-
+        ##新增用于无训练版本
+        use_shm = self.config.model.get("use_shm", False)
+        local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+        trust_remote_code=self.config.model.get("trust_remote_code", False)
+        from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+        ##新增用于无训练版本
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
             if self.generation_config is not None
@@ -915,11 +975,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            loop = get_event_loop()
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
@@ -949,6 +1005,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # clear kv cache
         get_torch_device().empty_cache()
         self._time_dict_trace['generation'] += (time.time() - _begin_time)
+        
+        #update long_tile_status
+        # is_tail = self._detect_long_tail_from_output(output)
+        # if is_tail != self._in_tail_mode:
+        #     self._in_tail_mode = is_tail
+        #     # 全局 flag（你 MoE 层或别的地方也可以读）
+        #     import os
+        #     os.environ["VERL_ROLLOUT_TAIL_MODE"] = "1" if is_tail else "0"
+        #     # 调用 vLLMRollout 的切换接口
+        #     if hasattr(self.rollout, "set_tail_mode"):
+        #         self.rollout.set_tail_mode(is_tail)
+
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -1149,6 +1217,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         for key, value in self._time_dict_trace.items():
             if (not stage) or stage in key:
                 self._time_dict_trace[key] = 0
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_tail_mode(self, in_tail: bool):
+        self._in_tail_mode = in_tail
+        import os
+        os.environ["VERL_ROLLOUT_TAIL_MODE"] = "1" if in_tail else "0"
+        if hasattr(self.rollout, "set_tail_mode"):
+            self.rollout.set_tail_mode(in_tail)
 
 
 class CriticWorker(Worker, DistProfilerExtension):

@@ -274,7 +274,6 @@ class vLLMRollout(BaseRollout):
         kwargs["n"] = 1  # already repeat in ray_trainer
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
-
         self.pad_token_id = tokenizer.pad_token_id
 
     @contextmanager
@@ -477,7 +476,7 @@ class vLLMRollout(BaseRollout):
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
                 lora_request=lora_requests,
-                use_tqdm=False,
+                use_tqdm=True,
             )
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable

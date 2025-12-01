@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 def is_torch_npu_available() -> bool:
     """Check the availability of NPU"""
     try:
+        import torch_npu
         if hasattr(torch, "npu") and callable(getattr(torch.npu, "is_available", None)):
             return torch.npu.is_available()
         return False
