@@ -199,6 +199,8 @@ class RLHFDataset(Dataset):
 
         # 1) 按比例采样（dataset_fraction），直接取前 sample_size 个
         dataset_fraction = float(self.config.get("dataset_fraction", 1.0))
+        shuffle = bool(self.config.get("shuffle", False))
+        seed_val = self.config.get("seed", None)
         if dataset_fraction < 1.0:
             sample_size = int(total * dataset_fraction)
             # 直接取前 sample_size 个样本以保证可复现（不打乱）
@@ -210,7 +212,7 @@ class RLHFDataset(Dataset):
         #    这里在 dataset_fraction 之后再应用 max_samples（作为上限）
         # 期望的属性： self.max_samples (int), self.shuffle (bool), self.seed (int or None)
         try:
-            max_samples = int(getattr(self, "max_samples", -1))
+            max_samples = int(self.config.get("max_samples", -1))
         except Exception:
             max_samples = -1
 
@@ -220,11 +222,8 @@ class RLHFDataset(Dataset):
         if max_samples > 0:
             total = len(self.dataframe)
             if max_samples < total:
-                if getattr(self, "shuffle", False):
-                    # 使用可重复的 numpy RNG（由 seed 控制）做不放回抽样
-                    rng_args = (getattr(self, "seed", None),)
+                if shuffle:
                     # np.random.default_rng requires None -> no-arg, so handle accordingly
-                    seed_val = getattr(self, "seed", None)
                     if seed_val is None:
                         rng = np.random.default_rng()
                     else:
