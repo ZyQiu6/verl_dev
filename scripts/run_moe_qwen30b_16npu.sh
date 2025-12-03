@@ -18,6 +18,13 @@ export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256
 # export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 # allenai/OLMoE-1B-7B-0924-Instruct
 # +actor_rollout_ref.rollout.enable_expert_parallel=False\
+#外部设置DP环境变量
+NODES=1
+INFER_TP=4
+INFER_DP=$((NODES * 16 / INFER_TP))
+# export VLLM_DP_SIZE=${INFER_DP}
+MAX_PROMPT_LENGTH=256
+MAX_RESPONSE_LENGTH=4096
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=/root/verl_dev/data/gsm8k/train.parquet \
@@ -25,8 +32,8 @@ python3 -m verl.trainer.main_ppo \
     data.dataset_fraction=0.1 \
     data.train_batch_size=32 \
     data.val_batch_size=512 \
-    data.max_prompt_length=256 \
-    data.max_response_length=4096 \
+    data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
+    data.max_response_length="${MAX_RESPONSE_LENGTH}" \
     actor_rollout_ref.rollout.name="vllm" \
     actor_rollout_ref.model.path=/home/data/Qwen3-30B-A3B\
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -34,16 +41,15 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.rollout.max_num_batched_tokens=20000 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=True\
-    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
-    +actor_rollout_ref.rollout.enable_expert_parallel=False \
-    actor_rollout_ref.rollout.data_parallel_size=4\
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${INFER_TP} \
+    +actor_rollout_ref.rollout.enable_expert_parallel=True\
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
     critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
@@ -61,4 +67,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=-1 \
     trainer.val_before_train=False \
     trainer.device=npu \
-    trainer.total_epochs=1 $@ >> qwen30b-record-16npu_16dp4tp4_acl_4096.txt
+    trainer.total_epochs=1 $@ >> qwen30b-record-16npu_external4dp4tp.txt

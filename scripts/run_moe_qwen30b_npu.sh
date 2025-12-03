@@ -6,7 +6,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # export VLLM_ALL2ALL_BACKEND=deepep_low_latency
 export VLLM_MOE_STATS=1
-export HCCL_BUFFSIZE=400
+export HCCL_BUFFSIZE=800
 # Load model from ModelScope to speed up download
 export VLLM_USE_MODELSCOPE=True
 # Set `max_split_size_mb` to reduce memory fragmentation and avoid out of memory

@@ -251,7 +251,6 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             enable_expert_parallel=config.enable_expert_parallel,
-            data_parallel_size=config.data_parallel_size,
             seed=config.get("seed", 0),
             **compilation_config,
             **self.lora_kwargs,
