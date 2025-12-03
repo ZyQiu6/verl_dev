@@ -1,0 +1,70 @@
+#!/bin/sh
+export HYDRA_FULL_ERROR=1
+export VLLM_USE_V1=1
+export RAY_DEDUP_LOGS=0
+export HF_ENDPOINT=https://hf-mirror.com
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+# export VLLM_ALL2ALL_BACKEND=deepep_low_latency
+export VLLM_MOE_STATS=1
+export HCCL_BUFFSIZE=800
+# Load model from ModelScope to speed up download
+export VLLM_USE_MODELSCOPE=True
+# Set `max_split_size_mb` to reduce memory fragmentation and avoid out of memory
+export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256
+# export ASCEND_GLOBAL_LOG_LEVEL=0
+# export ASCEND_SLOG_PRINT_TO_STDOUT=1
+#export VLLM_MOE_DP_CHUNK_SIZE=128
+#tp需要设置以下：
+# export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+# allenai/OLMoE-1B-7B-0924-Instruct
+# +actor_rollout_ref.rollout.enable_expert_parallel=False\
+#外部设置DP环境变量
+NODES=1
+INFER_TP=4
+INFER_DP=$((NODES * 16 / INFER_TP))
+export VLLM_DP_SIZE=${INFER_DP}
+MAX_PROMPT_LENGTH=2048
+MAX_RESPONSE_LENGTH=32768
+
+python3 -m verl.trainer.main_ppo \
+    data.train_files=/root/verl_dev/data/gsm8k/train.parquet \
+    data.val_files=/root/verl_dev/data/gsm8k/test.parquet \
+    data.dataset_fraction=0.1 \
+    data.train_batch_size=32 \
+    data.val_batch_size=512 \
+    data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
+    data.max_response_length="${MAX_RESPONSE_LENGTH}" \
+    actor_rollout_ref.rollout.name="vllm" \
+    actor_rollout_ref.model.path=/home/data/Qwen3-30B-A3B\
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.free_cache_engine=True\
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${INFER_TP} \
+    +actor_rollout_ref.rollout.enable_expert_parallel=True\
+    critic.optim.lr=1e-5 \
+    critic.model.use_remove_padding=True \
+    critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+    critic.ppo_micro_batch_size_per_gpu=2 \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    +trainer.rollout_data_dir=/root/verl_dev/dump \
+    +trainer.rollout_length_dir=/root/verl_dev/dump \
+    trainer.critic_warmup=0 \
+    trainer.logger=['console'] \
+    trainer.project_name='verl_gsm8k_qwen30b' \
+    trainer.experiment_name='original' \
+    trainer.n_gpus_per_node=16 \
+    trainer.nnodes=1 \
+    trainer.save_freq=1000 \
+    trainer.test_freq=-1 \
+    trainer.val_before_train=False \
+    trainer.device=npu \
+    trainer.total_epochs=1 $@ >> qwen30b-record-16npu_external4dp4tp.txt
