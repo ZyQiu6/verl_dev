@@ -220,6 +220,13 @@ class vLLMRollout(BaseRollout):
                 "prompt_lookup_min": 2,
                 "prompt_lookup_max": 7,
             }
+        elif self.config.get("use_hspec_decode", False):
+            speculative_config = {
+                "method": "hspec",
+                "num_speculative_tokens": self.config.get("hspec_num_speculative_tokens", 5),
+                "hspec_similarity_threshold": self.config.get("hspec_similarity_threshold", 0.9),
+                "hspec_min_match_len": self.config.get("hspec_min_match_len", 1),
+            }
         else:
             speculative_config = None
 

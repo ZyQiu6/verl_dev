@@ -77,6 +77,13 @@ def run_ppo(config, task_runner_class=None) -> None:
         from vllm_ascend.spec_decode.global_module.prefix_tree import \
             init_history_trees
         init_history_trees()
+    
+    if config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+        from vllm_ascend.spec_decode.hspec_table import init_hspec_tables
+        similarity_threshold = config.actor_rollout_ref.rollout.get(
+            "hspec_similarity_threshold", 0.9
+        )
+        init_hspec_tables(similarity_threshold=similarity_threshold)
 
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head

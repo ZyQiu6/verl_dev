@@ -1033,6 +1033,14 @@ class RayPPOTrainer:
                 get_history_trees
             self.history_rollout_trees = get_history_trees()
 
+        # HSpec: Hidden State based Speculative Decoding
+        if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+            from vllm_ascend.spec_decode.hspec_table import get_hspec_tables
+            similarity_threshold = self.config.actor_rollout_ref.rollout.get(
+                "hspec_similarity_threshold", 0.9
+            )
+            self.hspec_tables = get_hspec_tables(similarity_threshold=similarity_threshold)
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1064,6 +1072,11 @@ class RayPPOTrainer:
                     self.history_rollout_trees.run_server()
                     time.sleep(3.0)
 
+                # start HSpec table server
+                if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False) and self.global_steps == 1:
+                    self.hspec_tables.run_server()
+                    time.sleep(3.0)
+
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
@@ -1078,6 +1091,9 @@ class RayPPOTrainer:
 
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
                         self.history_rollout_trees.stop_server()
+
+                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                        self.hspec_tables.stop_server()
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1259,6 +1275,56 @@ class RayPPOTrainer:
                                     prompt_id, response, token_level_scores.sum().item()))
                             self.history_rollout_trees.run_server()
 
+                    # HSpec: Update hidden state query tables
+                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                        ray_hspec_tasks = []
+                        with marked_timer("update_hspec_tables", timing_raw, color='teal'):
+                            metrics.update(self.hspec_tables.compute_metrics())
+                            # Step 1: Clear and recreate tables for each prompt
+                            for i in range(len(batch)):
+                                prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
+                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                ray_hspec_tasks.append(self.hspec_tables.delete(prompt_id))
+                                ray_hspec_tasks.append(self.hspec_tables.add_table(prompt_id))
+                            ray.get(ray_hspec_tasks)
+                            ray_hspec_tasks.clear()
+                            
+                            # Step 2: Add entries from rollout results
+                            for i in range(len(batch)):
+                                batch_item = batch[i]  # DataProtoItem
+                                token_level_scores = batch_item.batch["token_level_scores"]
+                                response = batch_item.batch["responses"].numpy().tolist()
+                                
+                                # Trim padding tokens
+                                try:
+                                    response_length = response.index(self.tokenizer.pad_token_id)
+                                    response = response[:response_length]
+                                except Exception as e:
+                                    response = response
+                                
+                                prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
+                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                reward = token_level_scores.sum().item()
+                                
+                                # Get hidden states if available in batch
+                                # Note: Hidden states need to be collected during generation
+                                # For skeleton, we use placeholder logic
+                                if "rollout_hidden_states" in batch_item.batch:
+                                    hidden_states = batch_item.batch["rollout_hidden_states"].numpy()
+                                    ray_hspec_tasks.append(
+                                        self.hspec_tables.add_entries_batch(
+                                            prompt_id, hidden_states, response, reward
+                                        )
+                                    )
+                                else:
+                                    # Fallback: Add entries without hidden states (placeholder)
+                                    # In actual implementation, hidden states should be collected
+                                    # during the generate_sequences call
+                                    pass
+                            
+                            # Restart the server for the next iteration
+                            self.hspec_tables.run_server()
+
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
@@ -1284,6 +1350,9 @@ class RayPPOTrainer:
 
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
                         ray.get(ray_history_spec_tasks)
+
+                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                        ray.get(ray_hspec_tasks)
 
                 # validate
                 if (
