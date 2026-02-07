@@ -22,7 +22,13 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from torch_npu import npu_rotary_mul as apply_rotary_emb
-from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
+try:
+    # Newer/standard public import path
+    from transformers import PretrainedConfig, PreTrainedModel
+except Exception:
+    # Backward compatibility with older internal layouts
+    from transformers.configuration_utils import PretrainedConfig
+    from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl
 from transformers.models.qwen3 import modeling_qwen3
 from transformers.models.qwen3_moe import modeling_qwen3_moe

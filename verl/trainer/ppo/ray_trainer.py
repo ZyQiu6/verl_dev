@@ -22,7 +22,8 @@ import json
 import os
 import uuid
 import time
-import matplotlib as plt
+import matplotlib
+import matplotlib.pyplot as plt
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -1257,7 +1258,7 @@ class RayPPOTrainer:
                                 prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
                                 ray_history_spec_tasks.append(self.history_rollout_trees.delete(prompt_id)) # clear the tree every epoch
-                                ray_history_spec_tasks.append(self.history_rollout_trees.add_tree(prompt_id)) # clear the tree every epoch
+                                ray_history_spec_tasks.append(self.history_rollout_trees.add_tree(prompt_id)) # setup the tree every epoch
                             ray.get(ray_history_spec_tasks)
                             ray_history_spec_tasks.clear()
                             for i in range(len(batch)):
@@ -1280,7 +1281,7 @@ class RayPPOTrainer:
                         ray_hspec_tasks = []
                         with marked_timer("update_hspec_tables", timing_raw, color='teal'):
                             metrics.update(self.hspec_tables.compute_metrics())
-                            # Step 1: Clear and recreate tables for each prompt
+                            # Clear and recreate tables for each prompt
                             for i in range(len(batch)):
                                 prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
                                 prompt_id = str(hash(tuple(prompt_token_ids)))
@@ -1289,7 +1290,7 @@ class RayPPOTrainer:
                             ray.get(ray_hspec_tasks)
                             ray_hspec_tasks.clear()
                             
-                            # Step 2: Add entries from rollout results
+                            # Add entries to table from rollout results
                             for i in range(len(batch)):
                                 batch_item = batch[i]  # DataProtoItem
                                 token_level_scores = batch_item.batch["token_level_scores"]
@@ -1417,6 +1418,25 @@ class RayPPOTrainer:
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+
+                # Keep these stable so experiments can diff reliably.
+                # Step time breakdown (alias of timing_s/* with a perf namespace).
+                for name, value in timing_raw.items():
+                    metrics.setdefault(f"perf/step_time_breakdown_s/{name}", float(value))
+
+                # Throughput aliases.
+                if "perf/throughput" in metrics:
+                    metrics.setdefault("perf/tokens_per_second_per_gpu", float(metrics["perf/throughput"]))
+                if "perf/total_num_tokens" in metrics and "perf/time_per_step" in metrics:
+                    t = float(metrics["perf/time_per_step"])
+                    tot = float(metrics["perf/total_num_tokens"])
+                    metrics.setdefault("perf/tokens_per_second_total", (tot / t) if t > 0 else 0.0)
+
+                # HSpec metric skeletons (0 when disabled / not yet populated).
+                metrics.setdefault("hspec/match_rate", 0.0)
+                metrics.setdefault("hspec/avg_draft_length", 0.0)
+                metrics.setdefault("hspec/query_times", 0.0)
+                metrics.setdefault("hspec/match_times", 0.0)
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):

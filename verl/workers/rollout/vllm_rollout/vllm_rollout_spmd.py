@@ -92,6 +92,9 @@ from verl.workers.rollout.vllm_rollout.utils import (
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# Print resolved speculative config once per process.
+_PRINTED_VLLM_SPEC_CONFIG = False
+
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -229,6 +232,12 @@ class vLLMRollout(BaseRollout):
             }
         else:
             speculative_config = None
+
+        global _PRINTED_VLLM_SPEC_CONFIG
+        if not _PRINTED_VLLM_SPEC_CONFIG:
+            _PRINTED_VLLM_SPEC_CONFIG = True
+            # Use WARNING to surface this even when VERL_LOGGING_LEVEL=WARN.
+            logger.warning("Resolved vLLM speculative_config: %s", speculative_config)
 
         compilation_config = {}
 
