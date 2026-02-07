@@ -1254,9 +1254,10 @@ class RayPPOTrainer:
                         ray_history_spec_tasks = []
                         with marked_timer("update_rollout_suffix_tree", timing_raw, color='navy'):
                             metrics.update(self.history_rollout_trees.compute_metrics())
+                            from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
                             for i in range(len(batch)):
                                 prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
-                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
                                 ray_history_spec_tasks.append(self.history_rollout_trees.delete(prompt_id)) # clear the tree every epoch
                                 ray_history_spec_tasks.append(self.history_rollout_trees.add_tree(prompt_id)) # setup the tree every epoch
                             ray.get(ray_history_spec_tasks)
@@ -1271,7 +1272,7 @@ class RayPPOTrainer:
                                 except Exception as e:
                                     response = response
                                 prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
-                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
                                 ray_history_spec_tasks.append(self.history_rollout_trees.tree_append_node(
                                     prompt_id, response, token_level_scores.sum().item()))
                             self.history_rollout_trees.run_server()
@@ -1281,10 +1282,11 @@ class RayPPOTrainer:
                         ray_hspec_tasks = []
                         with marked_timer("update_hspec_tables", timing_raw, color='teal'):
                             metrics.update(self.hspec_tables.compute_metrics())
+                            from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
                             # Clear and recreate tables for each prompt
                             for i in range(len(batch)):
                                 prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
-                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
                                 ray_hspec_tasks.append(self.hspec_tables.delete(prompt_id))
                                 ray_hspec_tasks.append(self.hspec_tables.add_table(prompt_id))
                             ray.get(ray_hspec_tasks)
@@ -1304,7 +1306,7 @@ class RayPPOTrainer:
                                     response = response
                                 
                                 prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
-                                prompt_id = str(hash(tuple(prompt_token_ids)))
+                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
                                 reward = token_level_scores.sum().item()
                                 
                                 # Get hidden states if available in batch
