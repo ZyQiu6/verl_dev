@@ -409,6 +409,15 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
 
+        # HSpec: clear accumulated hidden states from any previous batch.
+        use_hspec = self.config.get("use_hspec_decode", False)
+        if use_hspec:
+            from vllm_ascend.spec_decode.hspec_utils import (
+                hspec_clear_store,
+                hspec_flush_and_get_all,
+            )
+            hspec_clear_store()
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
@@ -421,8 +430,16 @@ class vLLMRollout(BaseRollout):
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
+            # HSpec: flush accumulated hidden states from device → CPU.
+            # hspec_flush_and_get_all() performs one torch.stack().cpu()
+            # per request — the single sync point required by design-doc §7.
+            hs_store: dict = {}
+            if use_hspec:
+                hs_store = hspec_flush_and_get_all()
+
             response = []
             rollout_log_probs = []
+            rollout_hidden_states_list: list = []
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
@@ -432,6 +449,17 @@ class vLLMRollout(BaseRollout):
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
+                    # HSpec: extract hidden states for this sample.
+                    # Primary source: CompletionOutput.hidden_states
+                    #   (set by output_processor for finished requests).
+                    # Fallback: global store keyed by vLLM request_id.
+                    if use_hspec:
+                        hs = getattr(
+                            output.outputs[sample_id],
+                            'hidden_states', None)
+                        if hs is None:
+                            hs = hs_store.get(output.request_id)
+                        rollout_hidden_states_list.append(hs)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
@@ -475,6 +503,16 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+
+        # HSpec: pack accumulated hidden states into DataProto.
+        # Each element is either a numpy array (seq_len, hidden_dim)
+        # or None (when hidden states were not collected for that sample,
+        # e.g. spec decode with accept_length > 1).
+        # Stored in non_tensor_batch (object dtype) because sequence
+        # lengths vary across samples.
+        if use_hspec and rollout_hidden_states_list:
+            non_tensor_batch['rollout_hidden_states'] = np.array(
+                rollout_hidden_states_list, dtype=object)
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
