@@ -1040,7 +1040,17 @@ class RayPPOTrainer:
             similarity_threshold = self.config.actor_rollout_ref.rollout.get(
                 "hspec_similarity_threshold", 0.9
             )
-            self.hspec_tables = get_hspec_tables(similarity_threshold=similarity_threshold)
+            hspec_n_components = self.config.actor_rollout_ref.rollout.get(
+                "hspec_n_components", 64
+            )
+            hspec_max_entries = self.config.actor_rollout_ref.rollout.get(
+                "hspec_max_entries_per_prompt", 10000
+            )
+            self.hspec_tables = get_hspec_tables(
+                similarity_threshold=similarity_threshold,
+                n_components=hspec_n_components,
+                max_entries_per_prompt=hspec_max_entries,
+            )
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1278,54 +1288,110 @@ class RayPPOTrainer:
                             self.history_rollout_trees.run_server()
 
                     # HSpec: Update hidden state query tables
+                    # PCA fit + table build runs async in
+                    # partition actors so it does NOT block the training
+                    # critical path (actor update / fit()).
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                         ray_hspec_tasks = []
                         with marked_timer("update_hspec_tables", timing_raw, color='teal'):
                             metrics.update(self.hspec_tables.compute_metrics())
+                            from collections import defaultdict
                             from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
-                            # Clear and recreate tables for each prompt
+
+                            # Clear old tables (fire-and-forget; FIFO
+                            # ordering on each actor guarantees clear
+                            # completes before subsequent build).
+                            self.hspec_tables.clear()
+
+                            # Collect rollout data, grouped by prompt_id
+                            # for joint PCA fitting (GRPO: N rollouts
+                            # per prompt share one set of PCA params).
+                            prompt_build_data: dict = defaultdict(
+                                lambda: {"hidden_states": [], "tokens": [], "rewards": []}
+                            )
+                            _hspec_skip = 0
                             for i in range(len(batch)):
-                                prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
-                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
-                                ray_hspec_tasks.append(self.hspec_tables.delete(prompt_id))
-                                ray_hspec_tasks.append(self.hspec_tables.add_table(prompt_id))
-                            ray.get(ray_hspec_tasks)
-                            ray_hspec_tasks.clear()
-                            
-                            # Add entries to table from rollout results
-                            for i in range(len(batch)):
-                                batch_item = batch[i]  # DataProtoItem
-                                token_level_scores = batch_item.batch["token_level_scores"]
-                                response = batch_item.batch["responses"].numpy().tolist()
-                                
-                                # Trim padding tokens
+                                batch_item = batch[i]
+
+                                # Read hidden states from non_tensor_batch
+                                # (NOT batch – they are variable-length
+                                #  numpy objects, not padded tensors).
+                                hs = batch_item.non_tensor_batch.get(
+                                    "rollout_hidden_states"
+                                )
+                                if hs is None:
+                                    _hspec_skip += 1
+                                    continue
+
+                                # Response tokens – trim padding
+                                response = (
+                                    batch_item.batch["responses"]
+                                    .cpu()
+                                    .numpy()
+                                    .tolist()
+                                )
                                 try:
-                                    response_length = response.index(self.tokenizer.pad_token_id)
-                                    response = response[:response_length]
-                                except Exception as e:
-                                    response = response
-                                
-                                prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
-                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
-                                reward = token_level_scores.sum().item()
-                                
-                                # Get hidden states if available in batch
-                                # Note: Hidden states need to be collected during generation
-                                # For skeleton, we use placeholder logic
-                                if "rollout_hidden_states" in batch_item.batch:
-                                    hidden_states = batch_item.batch["rollout_hidden_states"].numpy()
-                                    ray_hspec_tasks.append(
-                                        self.hspec_tables.add_entries_batch(
-                                            prompt_id, hidden_states, response, reward
-                                        )
+                                    pad_idx = response.index(
+                                        self.tokenizer.pad_token_id
                                     )
-                                else:
-                                    # Fallback: Add entries without hidden states (placeholder)
-                                    # In actual implementation, hidden states should be collected
-                                    # during the generate_sequences call
+                                    response = response[:pad_idx]
+                                except ValueError:
                                     pass
-                            
-                            # Restart the server for the next iteration
+                                if len(response) == 0:
+                                    _hspec_skip += 1
+                                    continue
+
+                                # Alignment check
+                                if (
+                                    hasattr(hs, "shape")
+                                    and hs.ndim == 2
+                                    and hs.shape[0] != len(response)
+                                ):
+                                    _hspec_skip += 1
+                                    continue
+
+                                prompt_token_ids = batch_item.non_tensor_batch[
+                                    "vllm_inputs"
+                                ]
+                                prompt_id = prompt_id_from_token_ids(
+                                    prompt_token_ids
+                                )
+                                reward = (
+                                    batch_item.batch["token_level_scores"]
+                                    .sum()
+                                    .item()
+                                )
+
+                                prompt_build_data[prompt_id][
+                                    "hidden_states"
+                                ].append(hs)
+                                prompt_build_data[prompt_id]["tokens"].append(
+                                    response
+                                )
+                                prompt_build_data[prompt_id]["rewards"].append(
+                                    reward
+                                )
+
+                            if _hspec_skip > 0:
+                                logger.info(
+                                    "HSpec: skipped %d samples (no hs / "
+                                    "empty response / alignment mismatch)",
+                                    _hspec_skip,
+                                )
+
+                            # Async build: PCA fitting + table
+                            # construction run in partition actors.
+                            # Returns immediately (non-blocking).
+                            if prompt_build_data:
+                                ray_hspec_tasks = (
+                                    self.hspec_tables.build_tables_async(
+                                        dict(prompt_build_data)
+                                    )
+                                )
+
+                            # Queue ZMQ server start on each actor
+                            # (will execute after build completes
+                            #  due to Ray FIFO ordering).
                             self.hspec_tables.run_server()
 
                     # implement critic warmup

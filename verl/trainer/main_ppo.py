@@ -83,7 +83,17 @@ def run_ppo(config, task_runner_class=None) -> None:
         similarity_threshold = config.actor_rollout_ref.rollout.get(
             "hspec_similarity_threshold", 0.9
         )
-        init_hspec_tables(similarity_threshold=similarity_threshold)
+        hspec_n_components = config.actor_rollout_ref.rollout.get(
+            "hspec_n_components", 64
+        )
+        hspec_max_entries = config.actor_rollout_ref.rollout.get(
+            "hspec_max_entries_per_prompt", 10000
+        )
+        init_hspec_tables(
+            similarity_threshold=similarity_threshold,
+            n_components=hspec_n_components,
+            max_entries_per_prompt=hspec_max_entries,
+        )
 
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
