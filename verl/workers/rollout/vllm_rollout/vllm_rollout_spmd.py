@@ -377,8 +377,12 @@ class vLLMRollout(BaseRollout):
             input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
 
         # used for history tree
-        non_tensor_batch['vllm_inputs'] = np.array([input_data["prompt_token_ids"] for input_data in vllm_inputs], 
-                                                    dtype=object)
+        # NOTE: Force a 1D object array for robust DataProto.concat across
+        # different Ray workers (avoid accidental numeric 2D/3D arrays).
+        _vllm_inputs_list = [input_data["prompt_token_ids"] for input_data in vllm_inputs]
+        _vllm_inputs_arr = np.empty((len(_vllm_inputs_list),), dtype=object)
+        _vllm_inputs_arr[:] = _vllm_inputs_list
+        non_tensor_batch["vllm_inputs"] = _vllm_inputs_arr
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
@@ -432,7 +436,7 @@ class vLLMRollout(BaseRollout):
 
             # HSpec: flush accumulated hidden states from device → CPU.
             # hspec_flush_and_get_all() performs one torch.stack().cpu()
-            # per request — the single sync point required by design-doc §7.
+            # per request — the single sync point
             hs_store: dict = {}
             if use_hspec:
                 hs_store = hspec_flush_and_get_all()
@@ -511,8 +515,12 @@ class vLLMRollout(BaseRollout):
         # Stored in non_tensor_batch (object dtype) because sequence
         # lengths vary across samples.
         if use_hspec and rollout_hidden_states_list:
-            non_tensor_batch['rollout_hidden_states'] = np.array(
-                rollout_hidden_states_list, dtype=object)
+            # NOTE: Force a 1D object array so DataProto.concat can
+            # np.concatenate safely across workers.
+            _hs_list = list(rollout_hidden_states_list)
+            _hs_arr = np.empty((len(_hs_list),), dtype=object)
+            _hs_arr[:] = _hs_list
+            non_tensor_batch["rollout_hidden_states"] = _hs_arr
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

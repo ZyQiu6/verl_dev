@@ -1083,10 +1083,8 @@ class RayPPOTrainer:
                     self.history_rollout_trees.run_server()
                     time.sleep(3.0)
 
-                # start HSpec table server
-                if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False) and self.global_steps == 1:
-                    self.hspec_tables.run_server()
-                    time.sleep(3.0)
+                # HSpec: no ZMQ server needed – proposer uses local cache
+                # populated via Ray actor prefetch (on-device query).
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1103,8 +1101,7 @@ class RayPPOTrainer:
                     if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
                         self.history_rollout_trees.stop_server()
 
-                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
-                        self.hspec_tables.stop_server()
+                    # HSpec: no ZMQ server to stop – queries are local.
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1294,18 +1291,17 @@ class RayPPOTrainer:
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                         ray_hspec_tasks = []
                         with marked_timer("update_hspec_tables", timing_raw, color='teal'):
+                            # Metrics from the active tables that were
+                            # used for queries during this epoch's rollout.
                             metrics.update(self.hspec_tables.compute_metrics())
                             from collections import defaultdict
                             from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
 
-                            # Clear old tables (fire-and-forget; FIFO
-                            # ordering on each actor guarantees clear
-                            # completes before subsequent build).
-                            self.hspec_tables.clear()
-
                             # Collect rollout data, grouped by prompt_id
                             # for joint PCA fitting (GRPO: N rollouts
                             # per prompt share one set of PCA params).
+                            # Data is written to *building* tables
+                            # (double-buffer: active is read-only).
                             prompt_build_data: dict = defaultdict(
                                 lambda: {"hidden_states": [], "tokens": [], "rewards": []}
                             )
@@ -1373,26 +1369,19 @@ class RayPPOTrainer:
                                 )
 
                             if _hspec_skip > 0:
-                                logger.info(
-                                    "HSpec: skipped %d samples (no hs / "
-                                    "empty response / alignment mismatch)",
-                                    _hspec_skip,
-                                )
+                                print(
+                                    f"HSpec: skipped {_hspec_skip} samples (no hs / "
+                                    "empty response / alignment mismatch)")
 
-                            # Async build: PCA fitting + table
-                            # construction run in partition actors.
-                            # Returns immediately (non-blocking).
+                            # Async build into *building* tables.
+                            # PCA fitting + table construction run in
+                            # partition actors – non-blocking.
                             if prompt_build_data:
                                 ray_hspec_tasks = (
                                     self.hspec_tables.build_tables_async(
                                         dict(prompt_build_data)
                                     )
                                 )
-
-                            # Queue ZMQ server start on each actor
-                            # (will execute after build completes
-                            #  due to Ray FIFO ordering).
-                            self.hspec_tables.run_server()
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -1421,7 +1410,15 @@ class RayPPOTrainer:
                         ray.get(ray_history_spec_tasks)
 
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
-                        ray.get(ray_hspec_tasks)
+                        if ray_hspec_tasks:
+                            # HSpec: waiting for build tasks can become a
+                            # training bottleneck. Track it explicitly.
+                            with marked_timer("hspec_build_wait", timing_raw, color="teal"):
+                                ray.get(ray_hspec_tasks)
+                        # Build tasks for this step completed.
+                        # Data accumulates in *building* tables across
+                        # all steps within one epoch; swap is deferred
+                        # to the epoch boundary (see end of epoch loop).
 
                 # validate
                 if (
@@ -1525,6 +1522,11 @@ class RayPPOTrainer:
                     )
 
                 if is_last_step:
+                    # HSpec: swap before exit so final epoch's tables
+                    # are promoted (useful for checkpointing / eval).
+                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                        print(f"HSpec epoch swap (final): epoch={epoch} step={self.global_steps}")
+                        self.hspec_tables.swap()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1534,3 +1536,13 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+            # Epoch boundary: swap building → active
+            # All steps within this epoch have accumulated data in the
+            # *building* tables.  Swap makes the complete epoch's data
+            # queryable by the proposer in epoch E+1.  The proposer's
+            # version-aware cache will auto-invalidate on the next
+            # prefetch and pull the fresh data.
+            if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                print(f"HSpec epoch swap: epoch={epoch} (promote building -> active)")
+                self.hspec_tables.swap()
