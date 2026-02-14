@@ -1306,6 +1306,8 @@ class RayPPOTrainer:
                                 lambda: {"hidden_states": [], "tokens": [], "rewards": []}
                             )
                             _hspec_skip = 0
+                            _hspec_dbg_printed = 0
+                            _hspec_dbg_max = 6
                             for i in range(len(batch)):
                                 batch_item = batch[i]
 
@@ -1317,6 +1319,13 @@ class RayPPOTrainer:
                                 )
                                 if hs is None:
                                     _hspec_skip += 1
+                                    if os.getenv("HSPEC_DEBUG", "0") == "1" and _hspec_dbg_printed < _hspec_dbg_max:
+                                        print(
+                                            "[HSPEC_DEBUG] trainer.read_rollout_hidden_states"
+                                            f" idx={i} hs=None",
+                                            flush=True,
+                                        )
+                                        _hspec_dbg_printed += 1
                                     continue
 
                                 # Response tokens – trim padding
@@ -1335,6 +1344,13 @@ class RayPPOTrainer:
                                     pass
                                 if len(response) == 0:
                                     _hspec_skip += 1
+                                    if os.getenv("HSPEC_DEBUG", "0") == "1" and _hspec_dbg_printed < _hspec_dbg_max:
+                                        print(
+                                            "[HSPEC_DEBUG] trainer.read_rollout_hidden_states"
+                                            f" idx={i} response_empty hs_shape={getattr(hs,'shape',None)}",
+                                            flush=True,
+                                        )
+                                        _hspec_dbg_printed += 1
                                     continue
 
                                 # Alignment check
@@ -1344,7 +1360,49 @@ class RayPPOTrainer:
                                     and hs.shape[0] != len(response)
                                 ):
                                     _hspec_skip += 1
+                                    if os.getenv("HSPEC_DEBUG", "0") == "1" and _hspec_dbg_printed < _hspec_dbg_max:
+                                        print(
+                                            "[HSPEC_DEBUG] trainer.read_rollout_hidden_states"
+                                            f" idx={i} ALIGN_MISMATCH"
+                                            f" hs_shape={getattr(hs,'shape',None)}"
+                                            f" response_len={len(response)}",
+                                            flush=True,
+                                        )
+                                        # Values preview
+                                        if isinstance(hs, np.ndarray) and hs.ndim == 2 and hs.shape[0] > 0:
+                                            k = min(int(os.getenv("HSPEC_DEBUG_MAX_VALUES", "8")), hs.shape[1])
+                                            head = hs[0, :k].astype(np.float32).tolist()
+                                            tail = hs[-1, :k].astype(np.float32).tolist()
+                                            print(
+                                                "[HSPEC_DEBUG] trainer.hs_values"
+                                                f" head0[:{k}]={head}"
+                                                f" tail-1[:{k}]={tail}",
+                                                flush=True,
+                                            )
+                                        _hspec_dbg_printed += 1
                                     continue
+                                if os.getenv("HSPEC_DEBUG", "0") == "1" and _hspec_dbg_printed < _hspec_dbg_max:
+                                    print(
+                                        "[HSPEC_DEBUG] trainer.read_rollout_hidden_states"
+                                        f" idx={i}"
+                                        f" hs_type={type(hs).__name__}"
+                                        f" hs_shape={getattr(hs,'shape',None)}"
+                                        f" hs_dtype={getattr(hs,'dtype',None)}"
+                                        f" response_len={len(response)}"
+                                        f" aligned=True",
+                                        flush=True,
+                                    )
+                                    if isinstance(hs, np.ndarray) and hs.ndim == 2 and hs.shape[0] > 0:
+                                        k = min(int(os.getenv("HSPEC_DEBUG_MAX_VALUES", "8")), hs.shape[1])
+                                        head = hs[0, :k].astype(np.float32).tolist()
+                                        tail = hs[-1, :k].astype(np.float32).tolist()
+                                        print(
+                                            "[HSPEC_DEBUG] trainer.hs_values"
+                                            f" head0[:{k}]={head}"
+                                            f" tail-1[:{k}]={tail}",
+                                            flush=True,
+                                        )
+                                    _hspec_dbg_printed += 1
 
                                 prompt_token_ids = batch_item.non_tensor_batch[
                                     "vllm_inputs"
