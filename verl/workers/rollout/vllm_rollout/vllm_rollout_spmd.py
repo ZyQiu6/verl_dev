@@ -421,9 +421,6 @@ class vLLMRollout(BaseRollout):
                 hspec_flush_and_get_all,
             )
             hspec_clear_store()
-            # Debug: mark batch boundary.
-            if os.getenv("HSPEC_DEBUG", "0") == "1":
-                print("[HSPEC_DEBUG] vllm_rollout_spmd.batch_start", flush=True)
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -443,16 +440,6 @@ class vLLMRollout(BaseRollout):
             hs_store: dict = {}
             if use_hspec:
                 hs_store = hspec_flush_and_get_all()
-                if os.getenv("HSPEC_DEBUG", "0") == "1":
-                    try:
-                        print(
-                            "[HSPEC_DEBUG] vllm_rollout_spmd.flush_all"
-                            f" hs_store_num_reqs={len(hs_store)}"
-                            f" hs_store_keys_sample={list(hs_store.keys())[:5]}",
-                            flush=True,
-                        )
-                    except Exception:
-                        pass
 
             response = []
             rollout_log_probs = []
@@ -477,46 +464,6 @@ class vLLMRollout(BaseRollout):
                         if hs is None:
                             hs = hs_store.get(output.request_id)
                         rollout_hidden_states_list.append(hs)
-                        # Debug: print a small sample to verify chain.
-                        if os.getenv("HSPEC_DEBUG", "0") == "1":
-                            try:
-                                # Only print for first few samples in this process.
-                                _dbg_max = int(os.getenv("HSPEC_DEBUG_MAX_SAMPLES", "4"))
-                                if len(rollout_hidden_states_list) <= _dbg_max:
-                                    hs_shape = getattr(hs, "shape", None)
-                                    hs_dtype = getattr(hs, "dtype", None)
-                                    tok_len = len(response_ids) if response_ids is not None else None
-                                    align = None
-                                    try:
-                                        align = (hs is not None and hasattr(hs, "shape")
-                                                 and getattr(hs, "ndim", 0) == 2
-                                                 and hs.shape[0] == tok_len)
-                                    except Exception:
-                                        align = None
-                                    print(
-                                        "[HSPEC_DEBUG] vllm_rollout_spmd.extract"
-                                        f" request_id={output.request_id}"
-                                        f" sample_id={sample_id}"
-                                        f" token_ids_len={tok_len}"
-                                        f" hs_is_none={hs is None}"
-                                        f" hs_shape={hs_shape}"
-                                        f" hs_dtype={hs_dtype}"
-                                        f" aligned={align}",
-                                        flush=True,
-                                    )
-                                    # Print values for CPU numpy arrays only (safe).
-                                    if hs is not None and isinstance(hs, np.ndarray) and hs.ndim == 2:
-                                        k = min(int(os.getenv("HSPEC_DEBUG_MAX_VALUES", "8")), hs.shape[1])
-                                        head = hs[0, :k].astype(np.float32).tolist() if hs.shape[0] > 0 else None
-                                        tail = hs[-1, :k].astype(np.float32).tolist() if hs.shape[0] > 0 else None
-                                        print(
-                                            "[HSPEC_DEBUG] vllm_rollout_spmd.extract_values"
-                                            f" head0[:{k}]={head}"
-                                            f" tail-1[:{k}]={tail}",
-                                            flush=True,
-                                        )
-                            except Exception:
-                                pass
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
@@ -574,20 +521,6 @@ class vLLMRollout(BaseRollout):
             _hs_arr = np.empty((len(_hs_list),), dtype=object)
             _hs_arr[:] = _hs_list
             non_tensor_batch["rollout_hidden_states"] = _hs_arr
-            if os.getenv("HSPEC_DEBUG", "0") == "1":
-                try:
-                    nn = len(_hs_list)
-                    nn_none = sum(1 for x in _hs_list if x is None)
-                    first = next((x for x in _hs_list if isinstance(x, np.ndarray)), None)
-                    print(
-                        "[HSPEC_DEBUG] dataprot.pack_rollout_hidden_states"
-                        f" num={nn} none={nn_none}"
-                        f" first_shape={getattr(first,'shape',None)}"
-                        f" first_dtype={getattr(first,'dtype',None)}",
-                        flush=True,
-                    )
-                except Exception:
-                    pass
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

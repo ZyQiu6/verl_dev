@@ -1053,6 +1053,7 @@ class RayPPOTrainer:
             )
 
         for epoch in range(self.config.trainer.total_epochs):
+            _hspec_debug_pid = None  # reset per epoch; first step picks one prompt
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -1306,8 +1307,9 @@ class RayPPOTrainer:
                                 lambda: {"hidden_states": [], "tokens": [], "rewards": []}
                             )
                             _hspec_skip = 0
-                            _hspec_dbg_printed = 0
-                            _hspec_dbg_max = 6
+                            _hspec_none_count = 0
+                            _hspec_empty_resp_count = 0
+                            _hspec_align_fail_count = 0
                             for i in range(len(batch)):
                                 batch_item = batch[i]
 
@@ -1319,13 +1321,7 @@ class RayPPOTrainer:
                                 )
                                 if hs is None:
                                     _hspec_skip += 1
-                                    if os.getenv("HSPEC_DEBUG", "0") == "1" and _hspec_dbg_printed < _hspec_dbg_max:
-                                        print(
-                                            "[HSPEC_DEBUG] trainer.read_rollout_hidden_states"
-                                            f" idx={i} hs=None",
-                                            flush=True,
-                                        )
-                                        _hspec_dbg_printed += 1
+                                    _hspec_none_count += 1
                                     continue
 
                                 # Response tokens – trim padding
@@ -1344,13 +1340,7 @@ class RayPPOTrainer:
                                     pass
                                 if len(response) == 0:
                                     _hspec_skip += 1
-                                    if os.getenv("HSPEC_DEBUG", "0") == "1" and _hspec_dbg_printed < _hspec_dbg_max:
-                                        print(
-                                            "[HSPEC_DEBUG] trainer.read_rollout_hidden_states"
-                                            f" idx={i} response_empty hs_shape={getattr(hs,'shape',None)}",
-                                            flush=True,
-                                        )
-                                        _hspec_dbg_printed += 1
+                                    _hspec_empty_resp_count += 1
                                     continue
 
                                 # Alignment check
@@ -1360,49 +1350,8 @@ class RayPPOTrainer:
                                     and hs.shape[0] != len(response)
                                 ):
                                     _hspec_skip += 1
-                                    if os.getenv("HSPEC_DEBUG", "0") == "1" and _hspec_dbg_printed < _hspec_dbg_max:
-                                        print(
-                                            "[HSPEC_DEBUG] trainer.read_rollout_hidden_states"
-                                            f" idx={i} ALIGN_MISMATCH"
-                                            f" hs_shape={getattr(hs,'shape',None)}"
-                                            f" response_len={len(response)}",
-                                            flush=True,
-                                        )
-                                        # Values preview
-                                        if isinstance(hs, np.ndarray) and hs.ndim == 2 and hs.shape[0] > 0:
-                                            k = min(int(os.getenv("HSPEC_DEBUG_MAX_VALUES", "8")), hs.shape[1])
-                                            head = hs[0, :k].astype(np.float32).tolist()
-                                            tail = hs[-1, :k].astype(np.float32).tolist()
-                                            print(
-                                                "[HSPEC_DEBUG] trainer.hs_values"
-                                                f" head0[:{k}]={head}"
-                                                f" tail-1[:{k}]={tail}",
-                                                flush=True,
-                                            )
-                                        _hspec_dbg_printed += 1
+                                    _hspec_align_fail_count += 1
                                     continue
-                                if os.getenv("HSPEC_DEBUG", "0") == "1" and _hspec_dbg_printed < _hspec_dbg_max:
-                                    print(
-                                        "[HSPEC_DEBUG] trainer.read_rollout_hidden_states"
-                                        f" idx={i}"
-                                        f" hs_type={type(hs).__name__}"
-                                        f" hs_shape={getattr(hs,'shape',None)}"
-                                        f" hs_dtype={getattr(hs,'dtype',None)}"
-                                        f" response_len={len(response)}"
-                                        f" aligned=True",
-                                        flush=True,
-                                    )
-                                    if isinstance(hs, np.ndarray) and hs.ndim == 2 and hs.shape[0] > 0:
-                                        k = min(int(os.getenv("HSPEC_DEBUG_MAX_VALUES", "8")), hs.shape[1])
-                                        head = hs[0, :k].astype(np.float32).tolist()
-                                        tail = hs[-1, :k].astype(np.float32).tolist()
-                                        print(
-                                            "[HSPEC_DEBUG] trainer.hs_values"
-                                            f" head0[:{k}]={head}"
-                                            f" tail-1[:{k}]={tail}",
-                                            flush=True,
-                                        )
-                                    _hspec_dbg_printed += 1
 
                                 prompt_token_ids = batch_item.non_tensor_batch[
                                     "vllm_inputs"
@@ -1428,8 +1377,86 @@ class RayPPOTrainer:
 
                             if _hspec_skip > 0:
                                 print(
-                                    f"HSpec: skipped {_hspec_skip} samples (no hs / "
-                                    "empty response / alignment mismatch)")
+                                    f"HSpec: skipped {_hspec_skip} samples "
+                                    f"(hs_none={_hspec_none_count}, "
+                                    f"empty_resp={_hspec_empty_resp_count}, "
+                                    f"align_fail={_hspec_align_fail_count})")
+
+                            # HSpec Debug: per-epoch, first prompt
+                            if _hspec_debug_pid is None and prompt_build_data:
+                                _hspec_debug_pid = next(iter(prompt_build_data))
+                            if (_hspec_debug_pid is not None
+                                    and _hspec_debug_pid in prompt_build_data):
+                                _dbg = prompt_build_data[_hspec_debug_pid]
+                                _nr = len(_dbg["hidden_states"])
+                                print(f"\n{'='*60}")
+                                print(f"HSpec DEBUG (epoch={epoch}, "
+                                      f"step={self.global_steps})")
+                                print(f"{'='*60}")
+                                print(f"[0] batch_size={len(batch)}, "
+                                      f"prompts_collected="
+                                      f"{len(prompt_build_data)}, "
+                                      f"skipped={_hspec_skip}")
+                                print(f"[1] prompt_id = \"{_hspec_debug_pid}\"")
+                                # Find the original prompt tokens for this pid
+                                _dbg_prompt_tokens = None
+                                for _di in range(len(batch)):
+                                    _ditem = batch[_di]
+                                    _dpt = _ditem.non_tensor_batch.get(
+                                        "vllm_inputs")
+                                    if _dpt is not None:
+                                        _dpid = prompt_id_from_token_ids(_dpt)
+                                        if _dpid == _hspec_debug_pid:
+                                            _dbg_prompt_tokens = (
+                                                list(_dpt) if not isinstance(
+                                                    _dpt, list) else _dpt)
+                                            break
+                                if _dbg_prompt_tokens is not None:
+                                    _pl = len(_dbg_prompt_tokens)
+                                    print(f"    prompt_tokens (len={_pl}): "
+                                          f"{_dbg_prompt_tokens[:5]} ... "
+                                          f"{_dbg_prompt_tokens[-3:]}")
+                                    print(f"    prompt_token_ids type: "
+                                          f"{type(_dbg_prompt_tokens)}, "
+                                          f"element type: "
+                                          f"{type(_dbg_prompt_tokens[0]) if _pl > 0 else 'N/A'}")
+                                else:
+                                    print("    prompt_tokens: NOT FOUND "
+                                          "in batch!")
+                                print(f"[2] num_rollouts = {_nr}")
+                                for _ri in range(_nr):
+                                    _hs_i = _dbg["hidden_states"][_ri]
+                                    _tok_i = _dbg["tokens"][_ri]
+                                    _rew_i = _dbg["rewards"][_ri]
+                                    _hs_shape = (_hs_i.shape
+                                                 if hasattr(_hs_i, "shape")
+                                                 else "N/A")
+                                    _hs_dtype = (_hs_i.dtype
+                                                 if hasattr(_hs_i, "dtype")
+                                                 else "N/A")
+                                    _tl = len(_tok_i)
+                                    print(f"    rollout#{_ri}: "
+                                          f"hs_shape={_hs_shape}, "
+                                          f"hs_dtype={_hs_dtype}, "
+                                          f"resp_len={_tl}, "
+                                          f"reward={_rew_i:.4f}")
+                                    print(f"      resp_tokens[:8]="
+                                          f"{_tok_i[:8]}")
+                                    print(f"      resp_tokens[-5:]="
+                                          f"{_tok_i[-5:]}")
+                                    if hasattr(_hs_i, "shape") and _hs_i.ndim == 2:
+                                        import numpy as _dnp
+                                        _norms = _dnp.linalg.norm(
+                                            _hs_i, axis=1)
+                                        print(f"      hs_norms: "
+                                              f"min={_norms.min():.4f}, "
+                                              f"max={_norms.max():.4f}, "
+                                              f"mean={_norms.mean():.4f}")
+                                    if _ri >= 2:
+                                        print(f"    ... ({_nr - 3} more "
+                                              f"rollouts omitted)")
+                                        break
+                                print(f"{'='*60}\n")
 
                             # Async build into *building* tables.
                             # PCA fitting + table construction run in
@@ -1469,10 +1496,50 @@ class RayPPOTrainer:
 
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                         if ray_hspec_tasks:
-                            # HSpec: waiting for build tasks can become a
-                            # training bottleneck. Track it explicitly.
                             with marked_timer("hspec_build_wait", timing_raw, color="teal"):
                                 ray.get(ray_hspec_tasks)
+
+                        # HSpec Debug: table state after build
+                        if _hspec_debug_pid is not None:
+                            try:
+                                _tinfo = self.hspec_tables.debug_table_info(
+                                    _hspec_debug_pid)
+                                _b = _tinfo.get("building")
+                                _a = _tinfo.get("active")
+                                print(f"\n{'='*60}")
+                                print(f"HSpec DEBUG – TABLE STATE "
+                                      f"(epoch={epoch}, "
+                                      f"step={self.global_steps})")
+                                print(f"{'='*60}")
+                                print(f"prompt_id = "
+                                      f"\"{_hspec_debug_pid}\"")
+                                print(f"active_version = "
+                                      f"{_tinfo['active_version']}")
+                                print(f"building_prompt_count = "
+                                      f"{_tinfo['building_prompt_count']}")
+                                print(f"active_prompt_count = "
+                                      f"{_tinfo['active_prompt_count']}")
+                                if _b is not None:
+                                    print(f"[3] BUILDING table:")
+                                    for _k, _v in _b.items():
+                                        print(f"    {_k} = {_v}")
+                                else:
+                                    print(f"[3] BUILDING table: "
+                                          f"NOT FOUND (prompt absent "
+                                          f"in building!)")
+                                if _a is not None:
+                                    print(f"[4] ACTIVE table:")
+                                    for _k, _v in _a.items():
+                                        print(f"    {_k} = {_v}")
+                                else:
+                                    print(f"[4] ACTIVE table: "
+                                          f"NOT FOUND (expected for "
+                                          f"epoch 0)")
+                                print(f"{'='*60}\n")
+                            except Exception as _e:
+                                print(f"HSpec DEBUG: table query "
+                                      f"failed: {_e}")
+
                         # Build tasks for this step completed.
                         # Data accumulates in *building* tables across
                         # all steps within one epoch; swap is deferred
@@ -1580,11 +1647,10 @@ class RayPPOTrainer:
                     )
 
                 if is_last_step:
-                    # HSpec: swap before exit so final epoch's tables
-                    # are promoted (useful for checkpointing / eval).
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
-                        print(f"HSpec epoch swap (final): epoch={epoch} step={self.global_steps}")
                         self.hspec_tables.swap()
+                        print(f"HSpec: final swap at epoch={epoch}, "
+                              f"step={self.global_steps}")
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1596,11 +1662,39 @@ class RayPPOTrainer:
                     self.train_dataset.on_batch_end(batch=batch)
 
             # Epoch boundary: swap building → active
-            # All steps within this epoch have accumulated data in the
-            # *building* tables.  Swap makes the complete epoch's data
-            # queryable by the proposer in epoch E+1.  The proposer's
-            # version-aware cache will auto-invalidate on the next
-            # prefetch and pull the fresh data.
             if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
-                print(f"HSpec epoch swap: epoch={epoch} (promote building -> active)")
                 self.hspec_tables.swap()
+                # HSpec Debug: verify active table after swap
+                if _hspec_debug_pid is not None:
+                    try:
+                        _tinfo = self.hspec_tables.debug_table_info(
+                            _hspec_debug_pid)
+                        _a = _tinfo.get("active")
+                        _b = _tinfo.get("building")
+                        print(f"\n{'='*60}")
+                        print(f"HSpec DEBUG – AFTER SWAP "
+                              f"(epoch={epoch} done)")
+                        print(f"{'='*60}")
+                        print(f"prompt_id = \"{_hspec_debug_pid}\"")
+                        print(f"active_version = "
+                              f"{_tinfo['active_version']}")
+                        print(f"building_prompt_count = "
+                              f"{_tinfo['building_prompt_count']} "
+                              f"(should be 0)")
+                        print(f"active_prompt_count = "
+                              f"{_tinfo['active_prompt_count']}")
+                        if _a is not None:
+                            print(f"[5] ACTIVE table (post-swap):")
+                            for _k, _v in _a.items():
+                                print(f"    {_k} = {_v}")
+                        else:
+                            print(f"[5] ACTIVE table: NOT FOUND! "
+                                  f"Swap may have failed or "
+                                  f"prompt was never built!")
+                        if _b is not None:
+                            print(f"    WARNING: building still has "
+                                  f"data (should be empty)")
+                        print(f"{'='*60}\n")
+                    except Exception as _e:
+                        print(f"HSpec DEBUG: post-swap query "
+                              f"failed: {_e}")

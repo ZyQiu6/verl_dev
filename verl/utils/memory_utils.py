@@ -64,10 +64,10 @@ def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> Non
         reserved_freed = before_reserved - after_reserved
         allocated_freed = before_allocated - after_allocated
 
-        logger.info(
-            f"Memory cleanup attempt {attempt + 1}: Freed {reserved_freed / 1024**3:.2f} GB reserved, "
-            f"{allocated_freed / 1024**3:.2f} GB allocated"
-        )
+        # logger.info(
+        #     f"Memory cleanup attempt {attempt + 1}: Freed {reserved_freed / 1024**3:.2f} GB reserved, "
+        #     f"{allocated_freed / 1024**3:.2f} GB allocated"
+        # )
 
         # Stop retrying if little memory was freed
         if reserved_freed < 1024**3:  # less than 1GB
