@@ -1053,7 +1053,7 @@ class RayPPOTrainer:
             )
 
         for epoch in range(self.config.trainer.total_epochs):
-            _hspec_debug_pid = None  # reset per epoch; first step picks one prompt
+            # _hspec_debug_pid = None  # reset per epoch; first step picks one prompt
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -1307,9 +1307,9 @@ class RayPPOTrainer:
                                 lambda: {"hidden_states": [], "tokens": [], "rewards": []}
                             )
                             _hspec_skip = 0
-                            _hspec_none_count = 0
-                            _hspec_empty_resp_count = 0
-                            _hspec_align_fail_count = 0
+                            # _hspec_none_count = 0
+                            # _hspec_empty_resp_count = 0
+                            # _hspec_align_fail_count = 0
                             for i in range(len(batch)):
                                 batch_item = batch[i]
 
@@ -1321,7 +1321,7 @@ class RayPPOTrainer:
                                 )
                                 if hs is None:
                                     _hspec_skip += 1
-                                    _hspec_none_count += 1
+                                    # _hspec_none_count += 1
                                     continue
 
                                 # Response tokens – trim padding
@@ -1340,7 +1340,7 @@ class RayPPOTrainer:
                                     pass
                                 if len(response) == 0:
                                     _hspec_skip += 1
-                                    _hspec_empty_resp_count += 1
+                                    # _hspec_empty_resp_count += 1
                                     continue
 
                                 # Alignment check
@@ -1350,7 +1350,7 @@ class RayPPOTrainer:
                                     and hs.shape[0] != len(response)
                                 ):
                                     _hspec_skip += 1
-                                    _hspec_align_fail_count += 1
+                                    # _hspec_align_fail_count += 1
                                     continue
 
                                 prompt_token_ids = batch_item.non_tensor_batch[
@@ -1378,10 +1378,12 @@ class RayPPOTrainer:
                             if _hspec_skip > 0:
                                 print(
                                     f"HSpec: skipped {_hspec_skip} samples "
-                                    f"(hs_none={_hspec_none_count}, "
-                                    f"empty_resp={_hspec_empty_resp_count}, "
-                                    f"align_fail={_hspec_align_fail_count})")
-
+                                    # f"(hs_none={_hspec_none_count}, "
+                                    # f"empty_resp={_hspec_empty_resp_count}, "
+                                    # f"align_fail={_hspec_align_fail_count})")
+                                    f"")
+                            '''
+                            # debug Query Table
                             # HSpec Debug: per-epoch, first prompt
                             if _hspec_debug_pid is None and prompt_build_data:
                                 _hspec_debug_pid = next(iter(prompt_build_data))
@@ -1457,7 +1459,7 @@ class RayPPOTrainer:
                                               f"rollouts omitted)")
                                         break
                                 print(f"{'='*60}\n")
-
+                            '''
                             # Async build into *building* tables.
                             # PCA fitting + table construction run in
                             # partition actors – non-blocking.
@@ -1500,6 +1502,7 @@ class RayPPOTrainer:
                                 ray.get(ray_hspec_tasks)
 
                         # HSpec Debug: table state after build
+                        '''
                         if _hspec_debug_pid is not None:
                             try:
                                 _tinfo = self.hspec_tables.debug_table_info(
@@ -1539,7 +1542,7 @@ class RayPPOTrainer:
                             except Exception as _e:
                                 print(f"HSpec DEBUG: table query "
                                       f"failed: {_e}")
-
+                        '''
                         # Build tasks for this step completed.
                         # Data accumulates in *building* tables across
                         # all steps within one epoch; swap is deferred
@@ -1648,9 +1651,8 @@ class RayPPOTrainer:
 
                 if is_last_step:
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                        print(f"HSpec: final swap at epoch={epoch} step={self.global_steps}")
                         self.hspec_tables.swap()
-                        print(f"HSpec: final swap at epoch={epoch}, "
-                              f"step={self.global_steps}")
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1663,8 +1665,10 @@ class RayPPOTrainer:
 
             # Epoch boundary: swap building → active
             if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                print(f"HSpec: swap at epoch={epoch} (promote building -> active) ")
                 self.hspec_tables.swap()
                 # HSpec Debug: verify active table after swap
+                '''
                 if _hspec_debug_pid is not None:
                     try:
                         _tinfo = self.hspec_tables.debug_table_info(
@@ -1698,3 +1702,4 @@ class RayPPOTrainer:
                     except Exception as _e:
                         print(f"HSpec DEBUG: post-swap query "
                               f"failed: {_e}")
+                '''
