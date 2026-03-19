@@ -88,6 +88,14 @@ from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_PATH,
     get_vllm_max_lora_rank,
 )
+from vllm_ascend.spec_decode.hspec_utils import (
+    create_hspec_torch_npu_profiler,
+    hspec_clear_profile_context,
+    hspec_profile_enabled_for_step,
+    hspec_profile_output_dir,
+    hspec_record_function,
+    hspec_set_profile_context,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -346,6 +354,12 @@ class vLLMRollout(BaseRollout):
         eos_token_id = prompts.meta_info["eos_token_id"]
 
         batch_size = idx.size(0)
+        global_step = prompts.meta_info.get("global_steps")
+        profile_this_step = bool(
+            use_hspec := self.config.get("use_hspec_decode", False)
+        ) and hspec_profile_enabled_for_step(global_step)
+        profiler = None
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
         non_tensor_batch = prompts.non_tensor_batch
         if "raw_prompt_ids" not in non_tensor_batch:
@@ -414,115 +428,156 @@ class vLLMRollout(BaseRollout):
                 ] * batch_size
 
         # HSpec: clear accumulated hidden states from any previous batch.
-        use_hspec = self.config.get("use_hspec_decode", False)
         if use_hspec:
             from vllm_ascend.spec_decode.hspec_utils import (
                 hspec_clear_store,
                 hspec_flush_and_get_all,
             )
             hspec_clear_store()
-
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
+        if profile_this_step:
+            profile_dir = os.path.join(
+                hspec_profile_output_dir(),
+                f"step_{int(global_step)}",
             )
+            os.makedirs(profile_dir, exist_ok=True)
+            profiler = create_hspec_torch_npu_profiler(profile_dir)
+            hspec_set_profile_context(
+                enabled=True,
+                step=int(global_step),
+                req_idx=-1,
+            )
+            profiler.start()
+            try:
+                profiler.add_metadata_json(
+                    "hspec_profile_context",
+                    (
+                        f'{{"global_step": {int(global_step)}, '
+                        f'"req_scope": "all_requests", '
+                        f'"mode": "{os.getenv("HSPEC_PROFILE_METHOD", "mstx")}"}}'
+                    ),
+                )
+            except Exception:
+                pass
 
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
-            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+        try:
+            # users can customize different sampling_params at different run
+            with self.update_sampling_params(**kwargs):
+                with hspec_record_function("hspec/rollout/engine_generate", use_npu_stream=True):
+                    outputs = self.inference_engine.generate(
+                        prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                        sampling_params=self.sampling_params,
+                        lora_request=lora_requests,
+                        use_tqdm=False,
+                    )
 
-            # HSpec: flush accumulated hidden states from device → CPU.
-            # hspec_flush_and_get_all() performs one torch.stack().cpu()
-            # per request — the single sync point
-            hs_store: dict = {}
-            if use_hspec:
-                hs_store = hspec_flush_and_get_all()
+                # TODO(sgm): disable logprob when recompute_log_prob is enable
+                # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
-            response = []
-            rollout_log_probs = []
-            rollout_hidden_states_list: list = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
+                # HSpec: flush accumulated hidden states from device → CPU.
+                # hspec_flush_and_get_all() performs one torch.stack().cpu()
+                # per request — the single sync point
+                hs_store: dict = {}
+                if use_hspec:
+                    with hspec_record_function("hspec/rollout/hidden_state_flush", use_npu_stream=True):
+                        hs_store = hspec_flush_and_get_all()
+
+                response = []
+                rollout_log_probs = []
+                rollout_hidden_states_list: list = []
+                with hspec_record_function("hspec/rollout/output_collect"):
+                    for output in outputs:
+                        for sample_id in range(len(output.outputs)):
+                            response_ids = output.outputs[sample_id].token_ids
+                            response.append(response_ids)
+                            if self.config.calculate_log_probs:
+                                curr_log_prob = []
+                                for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                                    curr_log_prob.append(logprob[response_ids[i]].logprob)
+                                rollout_log_probs.append(curr_log_prob)
+                            # HSpec: extract hidden states for this sample.
+                            # Primary source: CompletionOutput.hidden_states
+                            #   (set by output_processor for finished requests).
+                            # Fallback: global store keyed by vLLM request_id.
+                            if use_hspec:
+                                hs = getattr(
+                                    output.outputs[sample_id],
+                                    'hidden_states', None)
+                                if hs is None:
+                                    hs = hs_store.get(output.request_id)
+                                rollout_hidden_states_list.append(hs)
+
+                with hspec_record_function("hspec/rollout/pad_concat", use_npu_stream=True):
+                    response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
+                        idx.device
+                    )
                     if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
-                    # HSpec: extract hidden states for this sample.
-                    # Primary source: CompletionOutput.hidden_states
-                    #   (set by output_processor for finished requests).
-                    # Fallback: global store keyed by vLLM request_id.
-                    if use_hspec:
-                        hs = getattr(
-                            output.outputs[sample_id],
-                            'hidden_states', None)
-                        if hs is None:
-                            hs = hs_store.get(output.request_id)
-                        rollout_hidden_states_list.append(hs)
+                        rollout_log_probs = pad_2d_list_to_length(
+                                rollout_log_probs, -1, max_length=self.config.response_length
+                        ).to(idx.device)
+                        rollout_log_probs = rollout_log_probs.to(torch.float32)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
-                idx.device
-            )
-            if self.config.calculate_log_probs:
-                rollout_log_probs = pad_2d_list_to_length(
-                    rollout_log_probs, -1, max_length=self.config.response_length
-                ).to(idx.device)
-                rollout_log_probs = rollout_log_probs.to(torch.float32)
+                    seq = torch.cat([idx, response], dim=-1)
 
-            seq = torch.cat([idx, response], dim=-1)
+            with hspec_record_function("hspec/rollout/metadata_pack", use_npu_stream=True):
+                response_length = response.size(1)
+                delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+                delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+                if position_ids.dim() == 3:  # qwen2vl mrope (batch size, 4, seq len)
+                    delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
 
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
-        if position_ids.dim() == 3:  # qwen2vl mrope (batch size, 4, seq len)
-            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
+                # TODO(sgm): fix position_ids on right_pad
+                # prompt: left pad + response: right pad
+                # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+                # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+                response_position_ids = position_ids[..., -1:] + delta_position_id
+                position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+                response_attention_mask = get_response_mask(
+                    response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+                )
+                attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
-        # TODO(sgm): fix position_ids on right_pad
-        # prompt: left pad + response: right pad
-        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-        response_position_ids = position_ids[..., -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(
-            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
-        )
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+                # all the tp ranks should contain the same data here. data in all ranks are valid
+                batch = TensorDict(
+                    {
+                        "prompts": idx,
+                        "responses": response,
+                        "input_ids": seq,  # here input_ids become the whole sentences
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                    },
+                    batch_size=batch_size,
+                )
+                if self.config.calculate_log_probs:
+                    # we will recompute old log prob with actor
+                    batch["rollout_log_probs"] = rollout_log_probs
 
-        # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                "prompts": idx,
-                "responses": response,
-                "input_ids": seq,  # here input_ids become the whole sentences
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=batch_size,
-        )
-        if self.config.calculate_log_probs:
-            # we will recompute old log prob with actor
-            batch["rollout_log_probs"] = rollout_log_probs
+                # HSpec: pack accumulated hidden states into DataProto.
+                # Each element is either a numpy array (seq_len, hidden_dim)
+                # or None (when hidden states were not collected for that sample,
+                # e.g. spec decode with accept_length > 1).
+                # Stored in non_tensor_batch (object dtype) because sequence
+                # lengths vary across samples.
+                if use_hspec and rollout_hidden_states_list:
+                    # NOTE: Force a 1D object array so DataProto.concat can
+                    # np.concatenate safely across workers.
+                    _hs_list = list(rollout_hidden_states_list)
+                    _hs_arr = np.empty((len(_hs_list),), dtype=object)
+                    _hs_arr[:] = _hs_list
+                    non_tensor_batch["rollout_hidden_states"] = _hs_arr
 
-        # HSpec: pack accumulated hidden states into DataProto.
-        # Each element is either a numpy array (seq_len, hidden_dim)
-        # or None (when hidden states were not collected for that sample,
-        # e.g. spec decode with accept_length > 1).
-        # Stored in non_tensor_batch (object dtype) because sequence
-        # lengths vary across samples.
-        if use_hspec and rollout_hidden_states_list:
-            # NOTE: Force a 1D object array so DataProto.concat can
-            # np.concatenate safely across workers.
-            _hs_list = list(rollout_hidden_states_list)
-            _hs_arr = np.empty((len(_hs_list),), dtype=object)
-            _hs_arr[:] = _hs_list
-            non_tensor_batch["rollout_hidden_states"] = _hs_arr
-
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+            return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        finally:
+            if profiler is not None:
+                try:
+                    torch.npu.synchronize()
+                except Exception:
+                    pass
+                try:
+                    profiler.step()
+                except Exception:
+                    pass
+                profiler.stop()
+            hspec_clear_profile_context()
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.
@@ -730,8 +785,6 @@ class vLLMAsyncRollout(BaseRollout):
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode."""
         raise NotImplementedError
-
-    # ==================== server mode public methods ====================
 
     def get_zeromq_address(self):
         return self.address
