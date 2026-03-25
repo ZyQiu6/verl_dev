@@ -17,6 +17,7 @@
 #
 set -e
 
+# debug
 export HYDRA_FULL_ERROR=1
 export VLLM_USE_V1=1
 export RAY_DEDUP_LOGS=0
@@ -25,6 +26,10 @@ export HSPEC_TRACE=0
 
 # super params
 export PCA_COMPONENTS=64
+
+# optim attempt
+export HSPEC_ENTRY=1
+export MATCH_WND=16
 
 # Disable ad-hoc text timing by default; use torch_npu.profiler.profile instead.
 export HSPEC_GEN="${HSPEC_GEN:-0}"
