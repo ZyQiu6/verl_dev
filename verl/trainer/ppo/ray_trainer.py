@@ -1307,9 +1307,9 @@ class RayPPOTrainer:
                                 lambda: {"hidden_states": [], "tokens": [], "rewards": []}
                             )
                             _hspec_skip = 0
-                            # _hspec_none_count = 0
-                            # _hspec_empty_resp_count = 0
-                            # _hspec_align_fail_count = 0
+                            _hspec_none_count = 0
+                            _hspec_empty_resp_count = 0
+                            _hspec_align_fail_count = 0
                             for i in range(len(batch)):
                                 batch_item = batch[i]
 
@@ -1321,7 +1321,7 @@ class RayPPOTrainer:
                                 )
                                 if hs is None:
                                     _hspec_skip += 1
-                                    # _hspec_none_count += 1
+                                    _hspec_none_count += 1
                                     continue
 
                                 # Response tokens – trim padding
@@ -1340,7 +1340,7 @@ class RayPPOTrainer:
                                     pass
                                 if len(response) == 0:
                                     _hspec_skip += 1
-                                    # _hspec_empty_resp_count += 1
+                                    _hspec_empty_resp_count += 1
                                     continue
 
                                 # Alignment check
@@ -1350,7 +1350,7 @@ class RayPPOTrainer:
                                     and hs.shape[0] != len(response)
                                 ):
                                     _hspec_skip += 1
-                                    # _hspec_align_fail_count += 1
+                                    _hspec_align_fail_count += 1
                                     continue
 
                                 prompt_token_ids = batch_item.non_tensor_batch[
@@ -1378,9 +1378,9 @@ class RayPPOTrainer:
                             if _hspec_skip > 0:
                                 print(
                                     f"HSpec: skipped {_hspec_skip} samples "
-                                    # f"(hs_none={_hspec_none_count}, "
-                                    # f"empty_resp={_hspec_empty_resp_count}, "
-                                    # f"align_fail={_hspec_align_fail_count})")
+                                    f"(hs_none={_hspec_none_count}, "
+                                    f"empty_resp={_hspec_empty_resp_count}, "
+                                    f"align_fail={_hspec_align_fail_count}, "
                                     f"")
                             '''
                             # debug Query Table

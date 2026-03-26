@@ -28,8 +28,9 @@ export HSPEC_TRACE=0
 export PCA_COMPONENTS=64
 
 # optim attempt
-export HSPEC_ENTRY=1
+export HSPEC_ENTRY=0
 export MATCH_WND=16
+export HSPEC_ADVAN_NGRAM=1
 
 # Disable ad-hoc text timing by default; use torch_npu.profiler.profile instead.
 export HSPEC_GEN="${HSPEC_GEN:-0}"
@@ -38,10 +39,10 @@ export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
 
 # torch_npu.profiler.profile for HSpec generate path.
 # Only profile selected training steps and annotate sub-stages with mstx/profile ranges.
-export HSPEC_PROFILE="${HSPEC_PROFILE:-1}"
+export HSPEC_PROFILE="${HSPEC_PROFILE:-0}"
 export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,31}"
 # export HSPEC_PROFILE_REQ_IDX="${HSPEC_PROFILE_REQ_IDX:-3}"
-export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile-1}"
+export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile-7}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
 export HSPEC_PROFILE_ANALYSE="${HSPEC_PROFILE_ANALYSE:-1}"
