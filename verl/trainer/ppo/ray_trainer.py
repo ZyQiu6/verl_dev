@@ -344,6 +344,15 @@ class RayPPOTrainer:
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
+        # HSpec offline-analysis dump (opt-in).
+        self._hspec_dump_enabled = os.getenv("HSPEC_DUMP", "0") != "0"
+        self._hspec_dump_root = os.getenv(
+            "HSPEC_DUMP_DIR",
+            "/workspace/exp/hspec_dump",
+        )
+        self._hspec_dump_epoch_meta_written: set[int] = set()
+        self._hspec_dump_tables_written: dict[int, set[str]] = defaultdict(set)
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -506,6 +515,158 @@ class RayPPOTrainer:
         with open(length_file, "w") as f:
             for i in range(n):
                 f.write(str(response_length[i]) + "\n")
+
+    @staticmethod
+    def _hspec_dump_object_array(items):
+        arr = np.empty((len(items),), dtype=object)
+        arr[:] = items
+        return arr
+
+    def _hspec_dump_epoch_dir(self, epoch: int) -> str:
+        return os.path.join(self._hspec_dump_root, f"epoch_{int(epoch):04d}")
+
+    def _maybe_write_hspec_dump_epoch_meta(
+        self,
+        epoch: int,
+        active_table_version: int,
+    ) -> None:
+        if not self._hspec_dump_enabled:
+            return
+        if epoch in self._hspec_dump_epoch_meta_written:
+            return
+
+        epoch_dir = self._hspec_dump_epoch_dir(epoch)
+        os.makedirs(epoch_dir, exist_ok=True)
+        meta = {
+            "epoch": int(epoch),
+            "global_step_at_first_dump": int(self.global_steps),
+            "active_table_version": int(active_table_version),
+            "pad_token_id": int(self.tokenizer.pad_token_id),
+            "hspec_dump_root": self._hspec_dump_root,
+        }
+        with open(os.path.join(epoch_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        self._hspec_dump_epoch_meta_written.add(epoch)
+
+    def _dump_hspec_rollouts_and_tables(
+        self,
+        epoch: int,
+        prompt_build_data: dict,
+    ) -> None:
+        """Dump current epoch rollouts and the active table used for querying.
+
+        Layout:
+          {HSPEC_DUMP_DIR}/epoch_{epoch:04d}/
+            meta.json
+            rollouts/step_{global_step:08d}/{prompt_id}.npz
+            tables/{prompt_id}.npz
+
+        For each prompt dump:
+        - all rollout sequences observed in this trainer step
+        - raw token-aligned hidden states
+        - PCA-projected hidden states under the *active* table used in this epoch
+        - the prompt-local active table snapshot itself (dumped once per epoch)
+        """
+        if not self._hspec_dump_enabled or not prompt_build_data:
+            return
+
+        prompt_ids = list(prompt_build_data.keys())
+        active_table_version, active_table_data = self.hspec_tables.prefetch_batch(prompt_ids)
+        self._maybe_write_hspec_dump_epoch_meta(epoch, active_table_version)
+
+        epoch_dir = self._hspec_dump_epoch_dir(epoch)
+        step_rollout_dir = os.path.join(
+            epoch_dir,
+            "rollouts",
+            f"step_{int(self.global_steps):08d}",
+        )
+        table_dir = os.path.join(epoch_dir, "tables")
+        os.makedirs(step_rollout_dir, exist_ok=True)
+        os.makedirs(table_dir, exist_ok=True)
+
+        written_tables = self._hspec_dump_tables_written[epoch]
+
+        for prompt_id, data in prompt_build_data.items():
+            prompt_token_ids = data.get("prompt_token_ids")
+            table_data = active_table_data.get(prompt_id)
+            table_present = table_data is not None
+
+            hidden_states_list = []
+            projected_hidden_states_list = []
+            projection_available = []
+
+            mean = None
+            components = None
+            if table_present:
+                mean = np.ascontiguousarray(table_data["mean"], dtype=np.float32)
+                components = np.ascontiguousarray(table_data["components"], dtype=np.float32)
+
+            for hs in data["hidden_states"]:
+                hs_np = np.ascontiguousarray(np.asarray(hs))
+                hidden_states_list.append(hs_np)
+                if table_present:
+                    hs_f32 = hs_np.astype(np.float32, copy=False)
+                    proj = np.ascontiguousarray((hs_f32 - mean) @ components.T, dtype=np.float32)
+                    projected_hidden_states_list.append(proj)
+                    projection_available.append(True)
+                else:
+                    projected_hidden_states_list.append(None)
+                    projection_available.append(False)
+
+            rollout_path = os.path.join(step_rollout_dir, f"{prompt_id}.npz")
+            np.savez_compressed(
+                rollout_path,
+                prompt_id=np.asarray(prompt_id),
+                prompt_token_ids=np.asarray(
+                    prompt_token_ids if prompt_token_ids is not None else [],
+                    dtype=np.int32,
+                ),
+                epoch=np.asarray(int(epoch), dtype=np.int32),
+                global_step=np.asarray(int(self.global_steps), dtype=np.int32),
+                active_table_version=np.asarray(int(active_table_version), dtype=np.int32),
+                table_present=np.asarray(bool(table_present), dtype=np.bool_),
+                rewards=np.asarray(data["rewards"], dtype=np.float32),
+                response_tokens=self._hspec_dump_object_array([
+                    np.ascontiguousarray(np.asarray(tok, dtype=np.int32))
+                    for tok in data["tokens"]
+                ]),
+                hidden_states=self._hspec_dump_object_array(hidden_states_list),
+                projected_hidden_states=self._hspec_dump_object_array(
+                    projected_hidden_states_list
+                ),
+                projection_available=np.asarray(projection_available, dtype=np.bool_),
+            )
+
+            if table_present and prompt_id not in written_tables:
+                table_path = os.path.join(table_dir, f"{prompt_id}.npz")
+                np.savez_compressed(
+                    table_path,
+                    prompt_id=np.asarray(prompt_id),
+                    prompt_token_ids=np.asarray(
+                        prompt_token_ids if prompt_token_ids is not None else [],
+                        dtype=np.int32,
+                    ),
+                    epoch=np.asarray(int(epoch), dtype=np.int32),
+                    active_table_version=np.asarray(int(active_table_version), dtype=np.int32),
+                    mean=np.ascontiguousarray(table_data["mean"], dtype=np.float32),
+                    components=np.ascontiguousarray(table_data["components"], dtype=np.float32),
+                    keys=np.ascontiguousarray(table_data["keys"]),
+                    rollout_seqs=self._hspec_dump_object_array([
+                        np.ascontiguousarray(np.asarray(seq, dtype=np.int32))
+                        for seq in table_data["rollout_seqs"]
+                    ]),
+                    entry_rollout_idx=np.ascontiguousarray(
+                        table_data["entry_rollout_idx"], dtype=np.int32
+                    ),
+                    entry_offset=np.ascontiguousarray(
+                        table_data["entry_offset"], dtype=np.int32
+                    ),
+                    n_entries=np.asarray(int(table_data["n_entries"]), dtype=np.int32),
+                    wnd_size=np.asarray(int(table_data.get("wnd_size", 0)), dtype=np.int32),
+                    max_wnd=np.asarray(int(table_data.get("max_wnd", 0)), dtype=np.int32),
+                    min_wnd=np.asarray(int(table_data.get("min_wnd", 0)), dtype=np.int32),
+                )
+                written_tables.add(prompt_id)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1304,7 +1465,12 @@ class RayPPOTrainer:
                             # Data is written to *building* tables
                             # (double-buffer: active is read-only).
                             prompt_build_data: dict = defaultdict(
-                                lambda: {"hidden_states": [], "tokens": [], "rewards": []}
+                                lambda: {
+                                    "hidden_states": [],
+                                    "tokens": [],
+                                    "rewards": [],
+                                    "prompt_token_ids": None,
+                                }
                             )
                             _hspec_skip = 0
                             _hspec_none_count = 0
@@ -1374,6 +1540,10 @@ class RayPPOTrainer:
                                 prompt_build_data[prompt_id]["rewards"].append(
                                     reward
                                 )
+                                if prompt_build_data[prompt_id]["prompt_token_ids"] is None:
+                                    prompt_build_data[prompt_id]["prompt_token_ids"] = list(
+                                        prompt_token_ids
+                                    )
 
                             if _hspec_skip > 0:
                                 print(
@@ -1463,6 +1633,12 @@ class RayPPOTrainer:
                             # Async build into *building* tables.
                             # PCA fitting + table construction run in
                             # partition actors – non-blocking.
+                            if prompt_build_data and self._hspec_dump_enabled:
+                                with marked_timer("hspec_dump", timing_raw, color="teal"):
+                                    self._dump_hspec_rollouts_and_tables(
+                                        epoch,
+                                        dict(prompt_build_data),
+                                    )
                             if prompt_build_data:
                                 ray_hspec_tasks = (
                                     self.hspec_tables.build_tables_async(
