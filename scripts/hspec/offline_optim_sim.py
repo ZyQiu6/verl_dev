@@ -412,7 +412,7 @@ def simulate_epoch(
     epoch_out_dir.mkdir(parents=True, exist_ok=True)
     decisions_dir = epoch_out_dir / "optim_decisions"
     decisions_dir.mkdir(parents=True, exist_ok=True)
-    step_summaries_dir = epoch_out_dir / "step_summaries"
+    step_summaries_dir = epoch_out_dir / "step_summaries_optim"
     step_summaries_dir.mkdir(parents=True, exist_ok=True)
 
     rollout_files = sorted(rollouts_dir.glob("step_*/*.npz")) if rollouts_dir.exists() else []

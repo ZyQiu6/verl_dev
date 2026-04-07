@@ -1,0 +1,138 @@
+20260318
+- 正确率方面：
+  表象选取（有一个module决定选哪个表象/选top k表象）
+    - ? 仅在附近位置的表象中取局部 max sim entry
+  tcp窗口控制针对性优化
+
+- performance方面
+  优化单request的propose过程：检查内部细节每一步运算的时间，是否能优化
+  batch维度：串行改并行，写kernel
+
+  -- 
+    def _extract_anchor_hs(
+    
+    def prompt_id_from_token_ids(prompt_token_ids: List[int]) -> str:
+
+    with (hspec_record_function("hspec/proposal/project_and_match", use_npu_stream=True)
+
+- 写paper
+  写出算法过程
+  找到我的方法能够预测对但其他方法预测不对的地方
+
+
+- 可调超参数
+  PCA-components
+  wnd_size
+  hspec_similarity_threshold
+
+
+
+
+20260323
+- 与histospec的优势对比（√）
+  找到那些histospec的前缀不匹配但是hspec预测正确的地方，统计下来
+
+- 正确率方面
+  top k draft：batch size小时可行，memory bound时
+  设计entry selector
+  是否能根据语义指导采样（比如decode到介词时正确率不高，而名词/形容词正确率较高）
+
+- performance方面
+  一个batch的prompt id只需要在batch开始时取一次，以后不会变
+  取prompt id / hidden state：应该可以拼成一个矩阵并行取回来
+  算PCA / sim：拼矩阵并行计算，后续有prompt完成decode时-矩阵对应地方置零并标记不查表
+
+
+
+
+20260330
+  实现 optim，观察与当前entry选择和len选择的区别，画图。
+    draft_len
+      optim - 所有table的每一个entry的draft_len的变化
+    similarity
+      每种policy - 一个epoch内一个prompt的geenrate过程中，选择的表象的similarity变化
+    每种policy的match_rate/avg_accept_len
+
+
+  entry-selector和draft_len-selector用function拟合的policy
+  
+
+
+
+
+entry-selector设计
+  一个关注点：是否每次predict都返回draft tokens。
+  由于取回draft进行rejection sample有开销，需要trade off。
+    两种policy：
+      a. 不管所有表象的质量多差，总取回其中质量最好的表象
+      b. 若表象质量过差，则放弃取回draft
+  (用function拟合)
+
+
+
+
+
+draft_len-selector设计
+  根据prompt/当前decoded token/decoded rollout sequence/历史rollout sequence的信息决定当前的draft length
+  可以作为任意specdecoding技术的plugin，不管是普通推理还是强化训练
+  设计insight：
+    · language pattern：考虑token id所代表的意思，如果当前token id可能处于一个常用的大词组/短语/句式中，增大draft len；如果是介词/冠词等没有特殊含义的词，则减小draft len或者不再给出draft
+    · 历史rollout序列之间的相似度/质量：定义一个衡量标准，建表时同步计算该prompt的rollout序列的相似度/质量（即计算该衡量指标），若质量高则更倾向于使用长draft len。（问题：如何定义历史rollout的“质量”，是否可以用相似度；另外，再训练过程中是否会存在由于历史rollou质量不高导致avg_accept_len明显小于其他的情况，否则该方法没用）
+（draft_len的更新改为针对每个entry的）
+
+
+每个epoch的table的创建和entry保留
+  不仅仅使用上一epoch的rollout信息，综合前面多轮epoch的信息，留下最高质量的entry
+
+
+
+
+性能模型(ms per token)
+  param
+    draft_rate(DR); match_rate(MR, already have draft); avg_accept_len(AAL); propose_overhead_wihth_draft(PDO); propose_overhead_non_draft(PNO); forward_overhead(FO); rejection-sample_overhead(RSO)
+  performance model
+    Non-Spec: FO
+    Spec: DR * MR * (PDO + FO + RSO) / AAL + (1 - DR) * (PNO + FO)
+
+
+
+  
+每个batch只需要在刚开始时prefetch一次即可
+
+
+
+
+generate_token_ids中直接使用self._batched_table_cache，每次检查cache的内容是否需要改变，如果需要则异步更新，不要每轮重建cache
+-> 实际上不需要更新cache，在每个batch开始时prefetch过来直到batch结束都不要更新。
+（self.runner.input_batch变化的频率，一个step内是否变化）
+将batch_indices/rows和PromptTableCache分开，cache不变，变的只是batch_indices/rows
+
+
+
+
+将draft_retrieve部分写成draft_retrieve_for_batch
+
+
+
+
+增加entry-selector需要修改match部分算子或者修改draft_retrieve部分逻辑
+
+
+
+HSpec 不仅仅能用于强化训练，可以用于任何高相似度上下文的场所，如一个对话框之内的多次prompt
+table可以调整为不仅仅按prompt区分，而是有一个更合理的区分方式，并且table的表象是动态调整的，留下质量最高的一些entry
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
