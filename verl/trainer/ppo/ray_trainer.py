@@ -352,6 +352,10 @@ class RayPPOTrainer:
         )
         self._hspec_dump_epoch_meta_written: set[int] = set()
         self._hspec_dump_tables_written: dict[int, set[str]] = defaultdict(set)
+        self._hspec_align_debug = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
+        self._hspec_align_debug_max_logs = int(
+            os.getenv("HSPEC_ALIGN_DEBUG_MAX_LOGS", "24")
+        )
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -1476,6 +1480,11 @@ class RayPPOTrainer:
                             _hspec_none_count = 0
                             _hspec_empty_resp_count = 0
                             _hspec_align_fail_count = 0
+                            _hspec_align_fail_trainer_len = 0
+                            _hspec_align_fail_upstream_hs = 0
+                            _hspec_align_fail_both = 0
+                            _hspec_align_fail_unknown = 0
+                            _hspec_align_debug_logged = 0
                             for i in range(len(batch)):
                                 batch_item = batch[i]
 
@@ -1491,19 +1500,27 @@ class RayPPOTrainer:
                                     continue
 
                                 # Response tokens – trim padding
-                                response = (
-                                    batch_item.batch["responses"]
-                                    .cpu()
-                                    .numpy()
-                                    .tolist()
+                                hspec_tokens = batch_item.non_tensor_batch.get(
+                                    "rollout_hspec_tokens"
                                 )
-                                try:
-                                    pad_idx = response.index(
-                                        self.tokenizer.pad_token_id
+                                if hspec_tokens is not None:
+                                    response = [int(x) for x in list(hspec_tokens)]
+                                    response_before_trim = list(response)
+                                else:
+                                    response = (
+                                        batch_item.batch["responses"]
+                                        .cpu()
+                                        .numpy()
+                                        .tolist()
                                     )
-                                    response = response[:pad_idx]
-                                except ValueError:
-                                    pass
+                                    response_before_trim = list(response)
+                                    try:
+                                        pad_idx = response.index(
+                                            self.tokenizer.pad_token_id
+                                        )
+                                        response = response[:pad_idx]
+                                    except ValueError:
+                                        pass
                                 if len(response) == 0:
                                     _hspec_skip += 1
                                     _hspec_empty_resp_count += 1
@@ -1517,6 +1534,75 @@ class RayPPOTrainer:
                                 ):
                                     _hspec_skip += 1
                                     _hspec_align_fail_count += 1
+                                    debug_meta = batch_item.non_tensor_batch.get(
+                                        "hspec_rollout_debug"
+                                    )
+                                    raw_response_len = None
+                                    raw_first_pad_idx = None
+                                    hs_len_debug = None
+                                    hs_source = None
+                                    response_head = None
+                                    response_tail = None
+                                    if isinstance(debug_meta, dict):
+                                        raw_response_len = debug_meta.get("raw_response_len")
+                                        raw_first_pad_idx = debug_meta.get("raw_response_first_pad_index")
+                                        hs_len_debug = debug_meta.get("hs_len")
+                                        hspec_token_len_debug = debug_meta.get("hspec_token_len")
+                                        hs_source = debug_meta.get("hs_source")
+                                        response_head = debug_meta.get("response_head")
+                                        response_tail = debug_meta.get("response_tail")
+                                    else:
+                                        hspec_token_len_debug = None
+                                    trainer_len_mismatch = (
+                                        raw_response_len is not None
+                                        and int(raw_response_len) != len(response)
+                                    )
+                                    upstream_hs_mismatch = (
+                                        hspec_token_len_debug is not None
+                                        and hs_len_debug is not None
+                                        and int(hspec_token_len_debug) >= 0
+                                        and int(hs_len_debug) >= 0
+                                        and int(hs_len_debug) != int(hspec_token_len_debug)
+                                    )
+                                    if trainer_len_mismatch and upstream_hs_mismatch:
+                                        _hspec_align_fail_both += 1
+                                        align_reason = "both"
+                                    elif trainer_len_mismatch:
+                                        _hspec_align_fail_trainer_len += 1
+                                        align_reason = "trainer_trim"
+                                    elif upstream_hs_mismatch:
+                                        _hspec_align_fail_upstream_hs += 1
+                                        align_reason = "upstream_hs"
+                                    else:
+                                        _hspec_align_fail_unknown += 1
+                                        align_reason = "unknown"
+
+                                    if (
+                                        self._hspec_align_debug
+                                        and _hspec_align_debug_logged < self._hspec_align_debug_max_logs
+                                    ):
+                                        _hspec_align_debug_logged += 1
+                                        try:
+                                            prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
+                                            prompt_id_dbg = prompt_id_from_token_ids(
+                                                prompt_token_ids
+                                            )
+                                        except Exception:
+                                            prompt_id_dbg = "<prompt_id_error>"
+                                        print(
+                                            "HSPEC ALIGN DEBUG: "
+                                            f"epoch={epoch} step={self.global_steps} item={i} "
+                                            f"reason={align_reason} prompt_id={prompt_id_dbg} "
+                                            f"trainer_trimmed_len={len(response)} "
+                                            f"padded_response_len={len(response_before_trim)} "
+                                            f"hs_len={int(hs.shape[0])} "
+                                            f"raw_response_len={raw_response_len} "
+                                            f"hspec_token_len={hspec_token_len_debug} "
+                                            f"raw_first_pad_idx={raw_first_pad_idx} "
+                                            f"hs_source={hs_source} "
+                                            f"response_head={response_head} "
+                                            f"response_tail={response_tail}"
+                                        )
                                     continue
 
                                 prompt_token_ids = batch_item.non_tensor_batch[
@@ -1551,6 +1637,10 @@ class RayPPOTrainer:
                                     f"(hs_none={_hspec_none_count}, "
                                     f"empty_resp={_hspec_empty_resp_count}, "
                                     f"align_fail={_hspec_align_fail_count}, "
+                                    f"align_fail_trainer_trim={_hspec_align_fail_trainer_len}, "
+                                    f"align_fail_upstream_hs={_hspec_align_fail_upstream_hs}, "
+                                    f"align_fail_both={_hspec_align_fail_both}, "
+                                    f"align_fail_unknown={_hspec_align_fail_unknown}, "
                                     f"")
                             '''
                             # debug Query Table

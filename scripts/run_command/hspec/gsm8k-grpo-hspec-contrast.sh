@@ -17,15 +17,28 @@
 #
 set -e
 
+# export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
+
 # debug
 export HYDRA_FULL_ERROR=1
 export VLLM_USE_V1=1
 export RAY_DEDUP_LOGS=0
 export HSPEC_DEBUG=0
 export HSPEC_TRACE=0
+export HSPEC_DUMP=0
 
 # super params
 export PCA_COMPONENTS=64
+
+# Numba in _build_batched_table_tensors()
+export HSPEC_DISABLE_NUMBA_REBUILD=0
+export HSPEC_NUMBA_REBUILD_MIN_ROWS=0
+export HSPEC_NUMBA_REBUILD_MIN_ELEMS=0
+
+# debug HSPEC_ALIGN_DEBUG
+export HSPEC_ALIGN_DEBUG=1
+export HSPEC_ALIGN_DEBUG_MAX_LOGS=24
+export HSPEC_ALIGN_DEBUG_PREVIEW=8
 
 # optim attempt
 export HSPEC_ENTRY=0
@@ -42,7 +55,7 @@ export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
 export HSPEC_PROFILE="${HSPEC_PROFILE:-0}"
 export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,31}"
 # export HSPEC_PROFILE_REQ_IDX="${HSPEC_PROFILE_REQ_IDX:-3}"
-export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile-7}"
+export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile-15}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
 export HSPEC_PROFILE_ANALYSE="${HSPEC_PROFILE_ANALYSE:-1}"
@@ -50,13 +63,17 @@ export HSPEC_PROFILE_WITH_STACK="${HSPEC_PROFILE_WITH_STACK:-0}"
 export HSPEC_PROFILE_MEMORY="${HSPEC_PROFILE_MEMORY:-0}"
 export USE_HISTORY_SPEC_DECODE="${USE_HISTORY_SPEC_DECODE:-False}"
 export USE_HSPEC_DECODE="${USE_HSPEC_DECODE:-True}"
-if [ "${HSPEC_PROFILE}" = "1" ]; then
+if [ "${HSPEC_DUMP}" = "0" ]; then
     export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
     export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
-    export ROLLOUT_N="${ROLLOUT_N:-2}"
+    export PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-8}"
+    export LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-40}"
+    export ROLLOUT_N="${ROLLOUT_N:-5}"
 else
-    export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
-    export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
+    export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+    export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
+    export PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}"
+    export LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}"
     export ROLLOUT_N="${ROLLOUT_N:-2}"
 fi
 
@@ -110,20 +127,20 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.actor.entropy_coeff=0.001 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=40 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=40 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.use_history_spec_decode="${USE_HISTORY_SPEC_DECODE}" \
     +actor_rollout_ref.rollout.use_hspec_decode="${USE_HSPEC_DECODE}" \

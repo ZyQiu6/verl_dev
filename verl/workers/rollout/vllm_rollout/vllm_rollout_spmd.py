@@ -102,6 +102,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Print resolved speculative config once per process.
 _PRINTED_VLLM_SPEC_CONFIG = False
+_HSPEC_ALIGN_DEBUG = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
+_HSPEC_ALIGN_DEBUG_PREVIEW = int(os.getenv("HSPEC_ALIGN_DEBUG_PREVIEW", "8"))
 
 # TODO
 # 1. support pp in vllm
@@ -305,6 +307,8 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self._hspec_align_debug = _HSPEC_ALIGN_DEBUG
+        self._hspec_align_debug_preview = _HSPEC_ALIGN_DEBUG_PREVIEW
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -484,6 +488,8 @@ class vLLMRollout(BaseRollout):
                 response = []
                 rollout_log_probs = []
                 rollout_hidden_states_list: list = []
+                rollout_hspec_token_ids_list: list = []
+                rollout_debug_list: list = []
                 with hspec_record_function("hspec/rollout/output_collect"):
                     for output in outputs:
                         for sample_id in range(len(output.outputs)):
@@ -499,12 +505,50 @@ class vLLMRollout(BaseRollout):
                             #   (set by output_processor for finished requests).
                             # Fallback: global store keyed by vLLM request_id.
                             if use_hspec:
+                                hs_source = "completion"
                                 hs = getattr(
                                     output.outputs[sample_id],
                                     'hidden_states', None)
+                                hspec_token_ids = getattr(
+                                    output.outputs[sample_id],
+                                    'hspec_token_ids', None)
                                 if hs is None:
-                                    hs = hs_store.get(output.request_id)
+                                    hs_source = "store"
+                                    payload = hs_store.get(output.request_id)
+                                    if payload is not None:
+                                        hs = payload.get("hidden_states")
+                                        if hspec_token_ids is None:
+                                            hspec_token_ids = payload.get("token_ids")
+                                    else:
+                                        hs = None
+                                if hs is None:
+                                    hs_source = "none"
                                 rollout_hidden_states_list.append(hs)
+                                rollout_hspec_token_ids_list.append(hspec_token_ids)
+                                if self._hspec_align_debug:
+                                    raw_pad_idx = -1
+                                    try:
+                                        raw_pad_idx = response_ids.index(self.pad_token_id)
+                                    except ValueError:
+                                        pass
+                                    hs_len = -1
+                                    if hasattr(hs, "shape") and getattr(hs, "ndim", None) == 2:
+                                        hs_len = int(hs.shape[0])
+                                    preview = int(self._hspec_align_debug_preview)
+                                    rollout_debug_list.append(
+                                        {
+                                            "request_id": str(output.request_id),
+                                            "sample_id": int(sample_id),
+                                            "raw_response_len": int(len(response_ids)),
+                                            "raw_response_first_pad_index": int(raw_pad_idx),
+                                            "hs_len": int(hs_len),
+                                            "hspec_token_len": int(len(hspec_token_ids))
+                                            if hspec_token_ids is not None else -1,
+                                            "hs_source": hs_source,
+                                            "response_head": list(response_ids[:preview]),
+                                            "response_tail": list(response_ids[-preview:]) if response_ids else [],
+                                        }
+                                    )
 
                 with hspec_record_function("hspec/rollout/pad_concat", use_npu_stream=True):
                     response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
@@ -564,6 +608,14 @@ class vLLMRollout(BaseRollout):
                     _hs_arr = np.empty((len(_hs_list),), dtype=object)
                     _hs_arr[:] = _hs_list
                     non_tensor_batch["rollout_hidden_states"] = _hs_arr
+                    _tok_list = list(rollout_hspec_token_ids_list)
+                    _tok_arr = np.empty((len(_tok_list),), dtype=object)
+                    _tok_arr[:] = _tok_list
+                    non_tensor_batch["rollout_hspec_tokens"] = _tok_arr
+                if use_hspec and self._hspec_align_debug and rollout_debug_list:
+                    _dbg_arr = np.empty((len(rollout_debug_list),), dtype=object)
+                    _dbg_arr[:] = rollout_debug_list
+                    non_tensor_batch["hspec_rollout_debug"] = _dbg_arr
 
             return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
         finally:
