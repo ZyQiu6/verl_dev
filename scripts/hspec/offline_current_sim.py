@@ -41,6 +41,7 @@ class TableView:
     wnd_size: int
     max_wnd: int
     min_wnd: int
+    similarity_threshold: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="First epoch to simulate (default: 1, since epoch 0 has no active table).",
+    )
+    parser.add_argument(
+        "--similarity-threshold",
+        type=float,
+        default=None,
+        help="Override HSpec similarity threshold. If omitted, read from dump meta/table or default to 0.9.",
     )
     return parser.parse_args()
 
@@ -106,6 +113,14 @@ def iter_epoch_dirs(dump_root: Path, epoch_start: int) -> Iterable[tuple[int, Pa
         yield epoch, epoch_dir
 
 
+def load_epoch_meta(epoch_dir: Path) -> dict[str, Any]:
+    meta_path = epoch_dir / "meta.json"
+    if not meta_path.exists():
+        return {}
+    with open(meta_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def load_table(path: Path) -> TableView:
     data = load_npz(path)
     rollout_seqs_obj = data["rollout_seqs"]
@@ -128,6 +143,9 @@ def load_table(path: Path) -> TableView:
         wnd_size=int(decode_scalar(data["wnd_size"])),
         max_wnd=int(decode_scalar(data["max_wnd"])),
         min_wnd=int(decode_scalar(data["min_wnd"])),
+        similarity_threshold=float(
+            decode_scalar(data["hspec_similarity_threshold"])
+        ) if "hspec_similarity_threshold" in data else 0.9,
     )
 
 
@@ -208,46 +226,37 @@ def simulate_rollout_current(
     pointer_advance_to: list[int] = []
     skip_positions: list[int] = []
 
-    current_wnd_size = int(table.wnd_size)
-    prev_accept_len = 1
+    entry_wnd_sizes = np.full((table.n_entries,), int(table.wnd_size), dtype=np.int32)
+    match_steps_count = 0
     pointer = 0
     while pointer < seq_len - 1:
         continuation = seq[pointer + 1:]
         query_key = proj[pointer]
-        current_wnd_size = update_window(
-            current_wnd_size,
-            prev_accept_len,
-            table.max_wnd,
-            table.min_wnd,
-        )
         sims = table.keys @ query_key
 
         if sims.shape[0] == 0:
             skip_positions.append(pointer)
-            prev_accept_len = 1
             pointer += 1
             continue
 
         best_entry_id = int(np.argmax(sims))
         best_similarity = float(sims[best_entry_id])
+        if best_similarity < float(table.similarity_threshold):
+            skip_positions.append(pointer)
+            pointer += 1
+            continue
         tie_count = int(np.sum(sims == sims[best_entry_id]))
 
         full_draft = entry_drafts[best_entry_id]
+        current_wnd_size = int(entry_wnd_sizes[best_entry_id])
         draft_len = min(len(full_draft), max(current_wnd_size, 0))
         if draft_len <= 0:
             skip_positions.append(pointer)
-            prev_accept_len = 1
             pointer += 1
             continue
 
         draft = full_draft[:draft_len]
         accept_len = longest_exact_match(draft, continuation)
-
-        if accept_len <= 0:
-            skip_positions.append(pointer)
-            prev_accept_len = 0
-            pointer += 1
-            continue
 
         pointer_positions.append(pointer)
         selected_entry_ids.append(best_entry_id)
@@ -260,18 +269,27 @@ def simulate_rollout_current(
         query_projected_hidden_states.append(np.ascontiguousarray(query_key, dtype=np.float32))
         selected_wnd_sizes.append(current_wnd_size)
         tie_counts.append(tie_count)
-        prev_accept_len = accept_len
-        pointer = pointer + accept_len
+        entry_wnd_sizes[best_entry_id] = update_window(
+            current_wnd_size,
+            accept_len,
+            table.max_wnd,
+            table.min_wnd,
+        )
+        if accept_len > 0:
+            match_steps_count += 1
+            pointer = pointer + accept_len
+        else:
+            pointer += 1
         pointer_advance_to.append(pointer)
 
     total_accept = int(sum(selected_accept_lengths))
     avg_accept = (
-        float(total_accept) / float(len(selected_accept_lengths))
-        if selected_accept_lengths else 0.0
+        float(total_accept) / float(match_steps_count)
+        if match_steps_count > 0 else 0.0
     )
     total_propose_steps = int(len(selected_entry_ids) + len(skip_positions))
     match_rate = (
-        float(len(selected_entry_ids)) / float(total_propose_steps)
+        float(match_steps_count) / float(total_propose_steps)
         if total_propose_steps > 0 else 0.0
     )
 
@@ -287,7 +305,7 @@ def simulate_rollout_current(
     )
 
     return {
-        "num_match_steps": int(len(selected_entry_ids)),
+        "num_match_steps": int(match_steps_count),
         "total_propose_steps": total_propose_steps,
         "match_rate": match_rate,
         "pointer_positions": np.asarray(pointer_positions, dtype=np.int32),
@@ -324,6 +342,31 @@ def write_rollout_result(
         float(total_num_match_steps) / float(total_propose_steps)
         if total_propose_steps > 0 else 0.0
     )
+    table_n_entries = int(meta["table_n_entries"])
+    entry_selected_accept_lengths: list[np.ndarray] = []
+    entry_selected_draft_lengths: list[np.ndarray] = []
+    for entry_id in range(table_n_entries):
+        accept_values: list[int] = []
+        draft_values: list[int] = []
+        for result in rollout_results:
+            entry_ids = np.asarray(result["selected_entry_ids"], dtype=np.int32)
+            if entry_ids.size == 0:
+                continue
+            mask = (entry_ids == entry_id)
+            if not np.any(mask):
+                continue
+            accept_values.extend(
+                np.asarray(result["selected_accept_lengths"], dtype=np.int32)[mask].tolist()
+            )
+            draft_values.extend(
+                np.asarray(result["selected_draft_lengths"], dtype=np.int32)[mask].tolist()
+            )
+        entry_selected_accept_lengths.append(
+            np.ascontiguousarray(np.asarray(accept_values, dtype=np.int32))
+        )
+        entry_selected_draft_lengths.append(
+            np.ascontiguousarray(np.asarray(draft_values, dtype=np.int32))
+        )
 
     payload: dict[str, Any] = {
         "strategy": np.asarray("current_hspec"),
@@ -338,10 +381,13 @@ def write_rollout_result(
         "table_wnd_size": np.asarray(meta["table_wnd_size"], dtype=np.int32),
         "table_max_wnd": np.asarray(meta["table_max_wnd"], dtype=np.int32),
         "table_min_wnd": np.asarray(meta["table_min_wnd"], dtype=np.int32),
+        "table_similarity_threshold": np.asarray(meta["table_similarity_threshold"], dtype=np.float32),
         "rollout_count": np.asarray(len(rollout_results), dtype=np.int32),
         "total_num_match_steps": np.asarray(total_num_match_steps, dtype=np.int32),
         "total_propose_steps": np.asarray(total_propose_steps, dtype=np.int32),
         "match_rate": np.asarray(match_rate, dtype=np.float32),
+        "entry_selected_accept_lengths": np.empty((table_n_entries,), dtype=object),
+        "entry_selected_draft_lengths": np.empty((table_n_entries,), dtype=object),
         "response_tokens": np.empty((len(response_tokens_list),), dtype=object),
         "num_match_steps": np.empty((len(rollout_results),), dtype=np.int32),
         "total_propose_steps_per_rollout": np.empty((len(rollout_results),), dtype=np.int32),
@@ -363,6 +409,8 @@ def write_rollout_result(
         "avg_optim_accept_length": np.empty((len(rollout_results),), dtype=np.float32),
     }
 
+    payload["entry_selected_accept_lengths"][:] = entry_selected_accept_lengths
+    payload["entry_selected_draft_lengths"][:] = entry_selected_draft_lengths
     payload["response_tokens"][:] = response_tokens_list
     for i, result in enumerate(rollout_results):
         payload["num_match_steps"][i] = result["num_match_steps"]
@@ -425,6 +473,7 @@ def simulate_epoch(
     epoch: int,
     epoch_dir: Path,
     output_root: Path,
+    similarity_threshold_override: float | None = None,
 ) -> dict[str, Any]:
     tables_dir = epoch_dir / "tables"
     rollouts_dir = epoch_dir / "rollouts"
@@ -434,6 +483,24 @@ def simulate_epoch(
     if tables_dir.exists():
         for table_path in sorted(tables_dir.glob("*.npz")):
             table = load_table(table_path)
+            if similarity_threshold_override is not None:
+                table = TableView(
+                    prompt_id=table.prompt_id,
+                    prompt_token_ids=table.prompt_token_ids,
+                    epoch=table.epoch,
+                    active_table_version=table.active_table_version,
+                    mean=table.mean,
+                    components=table.components,
+                    keys=table.keys,
+                    rollout_seqs=table.rollout_seqs,
+                    entry_rollout_idx=table.entry_rollout_idx,
+                    entry_offset=table.entry_offset,
+                    n_entries=table.n_entries,
+                    wnd_size=table.wnd_size,
+                    max_wnd=table.max_wnd,
+                    min_wnd=table.min_wnd,
+                    similarity_threshold=float(similarity_threshold_override),
+                )
             table_map[table.prompt_id] = table
             entry_drafts_map[table.prompt_id] = build_entry_drafts(table)
 
@@ -534,6 +601,7 @@ def simulate_epoch(
                 "table_wnd_size": table.wnd_size,
                 "table_max_wnd": table.max_wnd,
                 "table_min_wnd": table.min_wnd,
+                "table_similarity_threshold": table.similarity_threshold,
             },
             rollout_results=rollout_results,
             response_tokens_list=response_tokens_list,
@@ -563,7 +631,7 @@ def simulate_epoch(
         prompts_without_active_table=prompts_without_table,
     )
 
-    with open(epoch_out_dir / "summary.json", "w", encoding="utf-8") as f:
+    with open(epoch_out_dir / "summary_currrent.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     return summary
 
@@ -584,7 +652,18 @@ def main() -> None:
     overall_total_propose_steps = 0
     overall_total_accept_len = 0
     for epoch, epoch_dir in iter_epoch_dirs(dump_root, args.epoch_start):
-        summary = simulate_epoch(epoch, epoch_dir, output_root)
+        epoch_meta = load_epoch_meta(epoch_dir)
+        threshold = (
+            float(args.similarity_threshold)
+            if args.similarity_threshold is not None
+            else float(epoch_meta.get("hspec_similarity_threshold", 0.9))
+        )
+        summary = simulate_epoch(
+            epoch,
+            epoch_dir,
+            output_root,
+            similarity_threshold_override=threshold,
+        )
         all_summaries.append(summary)
         overall_prompts_simulated += int(summary["prompts_simulated"])
         overall_rollouts_simulated += int(summary["rollouts_simulated"])
@@ -614,7 +693,7 @@ def main() -> None:
             if overall_total_match_steps > 0 else 0.0
         ),
     }
-    with open(output_root / "summary_all_epochs.json", "w", encoding="utf-8") as f:
+    with open(output_root / "summary_all_epochs_current.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "overall": overall_summary,

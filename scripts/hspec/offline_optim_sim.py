@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default="/workspace/exp/hspec_optim_offline",
+        default="/workspace/exp/hspec_offline",
         required=True,
         help="Directory to write offline simulation outputs.",
     )
@@ -288,6 +288,31 @@ def write_rollout_result(
     response_tokens_list: list[np.ndarray],
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    table_n_entries = int(meta["table_n_entries"])
+    entry_selected_accept_lengths: list[np.ndarray] = []
+    entry_selected_draft_lengths: list[np.ndarray] = []
+    for entry_id in range(table_n_entries):
+        accept_values: list[int] = []
+        draft_values: list[int] = []
+        for result in rollout_results:
+            entry_ids = np.asarray(result["selected_entry_ids"], dtype=np.int32)
+            if entry_ids.size == 0:
+                continue
+            mask = (entry_ids == entry_id)
+            if not np.any(mask):
+                continue
+            accept_values.extend(
+                np.asarray(result["selected_accept_lengths"], dtype=np.int32)[mask].tolist()
+            )
+            draft_values.extend(
+                np.asarray(result["selected_draft_lengths"], dtype=np.int32)[mask].tolist()
+            )
+        entry_selected_accept_lengths.append(
+            np.ascontiguousarray(np.asarray(accept_values, dtype=np.int32))
+        )
+        entry_selected_draft_lengths.append(
+            np.ascontiguousarray(np.asarray(draft_values, dtype=np.int32))
+        )
 
     payload: dict[str, Any] = {
         "strategy": np.asarray("optim"),
@@ -300,6 +325,8 @@ def write_rollout_result(
         "rollout_input_path": np.asarray(str(meta["rollout_input_path"])),
         "table_n_entries": np.asarray(meta["table_n_entries"], dtype=np.int32),
         "rollout_count": np.asarray(len(rollout_results), dtype=np.int32),
+        "entry_selected_accept_lengths": np.empty((table_n_entries,), dtype=object),
+        "entry_selected_draft_lengths": np.empty((table_n_entries,), dtype=object),
         "total_num_match_steps": np.asarray(
             sum(int(r["num_match_steps"]) for r in rollout_results), dtype=np.int32
         ),
@@ -335,6 +362,8 @@ def write_rollout_result(
         "avg_optim_accept_length": np.empty((len(rollout_results),), dtype=np.float32),
     }
 
+    payload["entry_selected_accept_lengths"][:] = entry_selected_accept_lengths
+    payload["entry_selected_draft_lengths"][:] = entry_selected_draft_lengths
     payload["response_tokens"][:] = response_tokens_list
     for i, result in enumerate(rollout_results):
         payload["num_match_steps"][i] = result["num_match_steps"]
@@ -531,7 +560,7 @@ def simulate_epoch(
         prompts_without_active_table=prompts_without_table,
     )
 
-    with open(epoch_out_dir / "summary.json", "w", encoding="utf-8") as f:
+    with open(epoch_out_dir / "summary_optim.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     return summary
 
@@ -582,7 +611,7 @@ def main() -> None:
             if overall_total_match_steps > 0 else 0.0
         ),
     }
-    with open(output_root / "summary_all_epochs.json", "w", encoding="utf-8") as f:
+    with open(output_root / "summary_all_epochs_optim.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "overall": overall_summary,

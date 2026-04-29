@@ -547,6 +547,11 @@ class RayPPOTrainer:
             "active_table_version": int(active_table_version),
             "pad_token_id": int(self.tokenizer.pad_token_id),
             "hspec_dump_root": self._hspec_dump_root,
+            "hspec_similarity_threshold": float(
+                self.config.actor_rollout_ref.rollout.get(
+                    "hspec_similarity_threshold", 0.9
+                )
+            ),
         }
         with open(os.path.join(epoch_dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -652,6 +657,14 @@ class RayPPOTrainer:
                     ),
                     epoch=np.asarray(int(epoch), dtype=np.int32),
                     active_table_version=np.asarray(int(active_table_version), dtype=np.int32),
+                    hspec_similarity_threshold=np.asarray(
+                        float(
+                            self.config.actor_rollout_ref.rollout.get(
+                                "hspec_similarity_threshold", 0.9
+                            )
+                        ),
+                        dtype=np.float32,
+                    ),
                     mean=np.ascontiguousarray(table_data["mean"], dtype=np.float32),
                     components=np.ascontiguousarray(table_data["components"], dtype=np.float32),
                     keys=np.ascontiguousarray(table_data["keys"]),

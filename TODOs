@@ -46,11 +46,12 @@
 
 
 20260330
+  实现offline脚本分析(√)
   实现 optim，观察与当前entry选择和len选择的区别，画图。
     draft_len
-      optim - 所有table的每一个entry的draft_len的变化
+      每种policy - 所有table的每一个entry的draft_len的变化
     similarity
-      每种policy - 一个epoch内一个prompt的geenrate过程中，选择的表象的similarity变化
+      每种policy - 一个epoch内一个prompt的generate过程中，选择的表象的similarity变化
     每种policy的match_rate/avg_accept_len
 
 
